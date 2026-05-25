@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: amazon-fresh-scraper
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    # All values are set in the Render dashboard → Environment.
+    # sync: false means "do not check this value into render.yaml".
+    envVars:
+      # ── Amazon login (required) ──────────────────────────────────────────
+      - key: AMAZON_USERNAME
+        sync: false
+      - key: AMAZON_PASSWORD
+        sync: false
+      - key: AMAZON_AUTH_STATE
+        sync: false          # paste contents of auth_state.json after first local scrape
+
+      # ── Salesforce sync (optional — leave blank to skip sync) ────────────
+      - key: SF_TOKEN_URL
+        sync: false
+      - key: SF_CLIENT_ID
+        sync: false
+      - key: SF_CLIENT_SECRET
+        sync: false
+      - key: SF_API_ENDPOINT
+        sync: false
+
+      # ── Runtime ──────────────────────────────────────────────────────────
+      - key: HEADLESS
+        value: "true"

@@ -1,0 +1,11 @@
+.env
+auth_state.json
+credentials.json
+browser_profile/
+__pycache__/
+.venv/
+orders_report.json
+*.pyc
+*.png
+.claude/
+.DS_Store
