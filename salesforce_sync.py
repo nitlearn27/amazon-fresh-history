@@ -52,8 +52,7 @@ AVAILABILITY_FIELD = "availability__c"
 SOURCE_FIELD = "source__c"
 SCRAPED_AT_FIELD = "scraped_at__c"
 
-# Side-channel object used to bridge Amazon's 2-step verification OTP from a
-# human (Salesforce UI) to a headless scraper. See fetch_amazon_otp.
+# Side-channel for the headless 2FA OTP bridge. See fetch_amazon_otp.
 OTP_OBJECT = "Purchase_Info__c"
 OTP_FIELD = "my_amazon_otp__c"
 
@@ -65,14 +64,8 @@ class SalesforceError(RuntimeError):
     pass
 
 
-def _config_present() -> bool:
-    return all((os.getenv(k) or "").strip() for k in _REQUIRED_ENV)
-
-
 def config_present() -> bool:
-    """Public alias of _config_present() so callers outside this module can
-    cheaply check whether the OTP / sync features have credentials available."""
-    return _config_present()
+    return all((os.getenv(k) or "").strip() for k in _REQUIRED_ENV)
 
 
 def _env(name: str) -> str:
@@ -240,7 +233,7 @@ def sync_products(products: Iterable[dict]) -> dict:
     """
     stats = {"created": 0, "updated": 0, "errors": 0, "skipped": 0}
 
-    if not _config_present():
+    if not config_present():
         missing = [k for k in _REQUIRED_ENV if not (os.getenv(k) or "").strip()]
         print(f"[salesforce] Sync skipped — missing env vars: {', '.join(missing)}")
         stats["skipped"] = 1
@@ -283,11 +276,7 @@ def sync_products(products: Iterable[dict]) -> dict:
 
 
 def fetch_amazon_otp() -> tuple[str, str] | None:
-    """Query Purchase_Info__c for a non-null OTP value.
-
-    Returns (record_id, otp) when a record has my_amazon_otp__c set, else None.
-    Raises SalesforceError on transport/auth failures so the caller can decide
-    whether to retry or abort the polling loop."""
+    """Return (record_id, otp) from Purchase_Info__c, or None if no OTP is set."""
     soql = (
         f"SELECT Id, {OTP_FIELD} FROM {OTP_OBJECT} "
         f"WHERE {OTP_FIELD} != null LIMIT 1"
@@ -312,8 +301,7 @@ def fetch_amazon_otp() -> tuple[str, str] | None:
 
 
 def clear_amazon_otp(record_id: str) -> None:
-    """Null out Purchase_Info__c.my_amazon_otp__c for the given record so the
-    next run does not pick up a stale OTP."""
+    """Null out Purchase_Info__c.my_amazon_otp__c so the next run sees no stale OTP."""
     url = (
         f"{_instance_root()}{_api_version_path()}"
         f"/sobjects/{OTP_OBJECT}/{record_id}"

@@ -1,8 +1,7 @@
 """
 Amazon Fresh (amazon.in) order history scraper.
-Login: email/phone + password. Captcha / 2-step verification cannot be solved
-automatically — they require a one-time headed local run to capture
-auth_state.json. Subsequent runs reuse that session silently.
+Login: email/phone + password. OTP (2-step verification) is polled from
+Salesforce Purchase_Info__c.my_amazon_otp__c in headless mode.
 """
 
 import argparse
@@ -74,7 +73,6 @@ AMAZON_SIGNIN = (
 )
 AMAZON_ORDERS = "https://www.amazon.in/your-orders/orders?_encoding=UTF8&orderFilter=months-6"
 
-AUTH_STATE_FILE = Path("auth_state.json")
 ORDERS_REPORT_FILE = Path("orders_report.json")
 
 # Marker substrings that identify an Amazon Fresh order on the order list/details.
@@ -133,11 +131,6 @@ def parse_date(raw: str) -> str:
         return "unknown"
 
 
-def _is_server_environment() -> bool:
-    """Detect whether we're running on a headless server (Render, Docker, etc.)."""
-    return os.getenv("HEADLESS", "false").lower() in ("true", "1", "yes")
-
-
 _UNAVAILABLE_TERMS = (
     "currently unavailable",
     "out of stock",
@@ -173,9 +166,7 @@ def _extract_date_from_text(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 async def _log_page_state(page, label: str) -> None:
-    """Verbose breadcrumb so failures are easy to triage from the raw log.
-    Prints the URL, page title, and any visible heading text after each major
-    transition. Never raises — diagnostic-only."""
+    """Diagnostic breadcrumb: URL + title + first heading at a transition point."""
     try:
         url = page.url
     except Exception:
@@ -193,12 +184,6 @@ async def _log_page_state(page, label: str) -> None:
         print(f"[trace] {label}: title={title!r}")
     if heading:
         print(f"[trace] {label}: heading={heading[:120]!r}")
-
-
-async def save_auth(context) -> None:
-    storage = await context.storage_state()
-    AUTH_STATE_FILE.write_text(json.dumps(storage, indent=2), encoding="utf-8")
-    print("[auth] Amazon session saved to auth_state.json.")
 
 
 async def is_logged_in(page) -> bool:
@@ -226,8 +211,6 @@ async def _handle_captcha_block(page) -> None:
             "\n[error] Amazon presented a captcha.\n"
             "  • Re-run this scraper locally in HEADED mode (--headed=true) so you can\n"
             "    solve the captcha once by hand.\n"
-            "  • After a successful login, auth_state.json is written and the captcha\n"
-            "    challenge typically does not reappear for weeks.\n"
             f"  • Screenshot: {screenshot_path.resolve()}\n"
             f"  • URL       : {page.url}\n"
         )
@@ -238,10 +221,7 @@ async def _poll_salesforce_for_otp(
     poll_interval_seconds: int = 5,
     max_total_seconds: int = 180,
 ) -> tuple[str, str] | None:
-    """Headless OTP source: poll Salesforce Purchase_Info__c.my_amazon_otp__c
-    until a value appears or we time out. Returns (record_id, otp) on success,
-    None on timeout. Transport errors are logged and the loop continues —
-    momentary Salesforce outages should not kill an in-progress 2FA window."""
+    """Poll Salesforce for an OTP. Returns (record_id, otp) or None on timeout."""
     try:
         from salesforce_sync import (
             OTP_FIELD,
@@ -273,34 +253,32 @@ async def _poll_salesforce_for_otp(
     max_attempts = max(1, max_total_seconds // poll_interval_seconds)
     for attempt in range(1, max_attempts + 1):
         elapsed = (attempt - 1) * poll_interval_seconds
+        outcome = "empty"
         try:
             result = fetch_amazon_otp()
-            poll_outcome = "value-present" if result is not None else "empty"
         except SalesforceError as exc:
-            print(f"[auth] Salesforce OTP poll attempt {attempt}/{max_attempts} (t={elapsed}s) failed: {exc}")
+            print(f"[auth] Salesforce OTP poll {attempt}/{max_attempts} (t={elapsed}s) failed: {exc}")
             result = None
-            poll_outcome = "error"
+            outcome = "error"
         except Exception as exc:
-            print(f"[auth] Salesforce OTP poll attempt {attempt}/{max_attempts} (t={elapsed}s) unexpected error: {exc}")
+            print(f"[auth] Salesforce OTP poll {attempt}/{max_attempts} (t={elapsed}s) unexpected: {exc}")
             result = None
-            poll_outcome = "error"
+            outcome = "error"
         if result is not None:
             print(f"[auth] OTP received from Salesforce on attempt {attempt}/{max_attempts} (t={elapsed}s).")
             return result
-        # Log progress every attempt so the user can confirm the loop is alive.
         print(
-            f"[auth] Salesforce OTP poll attempt {attempt}/{max_attempts} "
-            f"(t={elapsed}s) → {poll_outcome}; sleeping {poll_interval_seconds}s…"
+            f"[auth] Salesforce OTP poll {attempt}/{max_attempts} "
+            f"(t={elapsed}s) → {outcome}; sleeping {poll_interval_seconds}s…"
         )
         if attempt < max_attempts:
             await asyncio.sleep(poll_interval_seconds)
     return None
 
 
-async def _handle_otp_challenge(page, headless: bool) -> bool:
-    """If Amazon asks for an OTP (2-step verification), source the code:
-      • Headless → poll Salesforce Purchase_Info__c.my_amazon_otp__c.
-      • Headed → prompt the user via stdin.
+async def _handle_otp_challenge(page) -> bool:
+    """If Amazon asks for an OTP (2-step verification), poll Salesforce
+    Purchase_Info__c.my_amazon_otp__c regardless of headed/headless mode.
     Returns True iff we entered an OTP."""
     otp_input = page.locator(SELECTORS["otp_input"]).first
     try:
@@ -310,29 +288,18 @@ async def _handle_otp_challenge(page, headless: bool) -> bool:
     except PlaywrightTimeoutError:
         return False
 
-    otp_record_id: str | None = None
-
-    if headless:
-        polled = await _poll_salesforce_for_otp()
-        if polled is None:
-            screenshot_path = Path("amazon_login_debug.png")
-            await page.screenshot(path=str(screenshot_path), full_page=True)
-            print(
-                "\n[error] No OTP appeared in Salesforce within the 3-minute window.\n"
-                "  • Set Purchase_Info__c.my_amazon_otp__c to the OTP that Amazon\n"
-                "    just emailed/SMS'd, then re-trigger the scrape.\n"
-                f"  • Screenshot: {screenshot_path.resolve()}\n"
-            )
-            sys.exit(1)
-        otp_record_id, otp = polled
-    else:
-        print("\n[auth] Amazon is asking for a 2-step verification OTP.")
-        print("[auth] Check the email or SMS Amazon just sent and paste the code below.")
-        try:
-            otp = input("       OTP: ").strip()
-        except EOFError:
-            print("[error] No interactive stdin available — cannot prompt for OTP.")
-            sys.exit(1)
+    polled = await _poll_salesforce_for_otp()
+    if polled is None:
+        screenshot_path = Path("amazon_login_debug.png")
+        await page.screenshot(path=str(screenshot_path), full_page=True)
+        print(
+            "\n[error] No OTP appeared in Salesforce within the 3-minute window.\n"
+            "  • Set Purchase_Info__c.my_amazon_otp__c to the OTP that Amazon\n"
+            "    just emailed/SMS'd, then re-trigger the scrape.\n"
+            f"  • Screenshot: {screenshot_path.resolve()}\n"
+        )
+        sys.exit(1)
+    otp_record_id, otp = polled
 
     if not re.fullmatch(r"\d{4,8}", otp):
         print(f"[error] {otp!r} does not look like a numeric OTP. Aborting.")
@@ -355,14 +322,13 @@ async def _handle_otp_challenge(page, headless: bool) -> bool:
         print("[auth] Post-OTP: networkidle did not fire within 15s (continuing).")
     await _log_page_state(page, "after OTP submit")
 
-    if otp_record_id is not None:
-        try:
-            from salesforce_sync import clear_amazon_otp
-            clear_amazon_otp(otp_record_id)
-            print("[auth] Cleared OTP from Salesforce.")
-        except Exception as exc:
-            # Login itself already succeeded — surface a warning but don't abort.
-            print(f"[auth] Warning: failed to clear OTP in Salesforce: {exc}")
+    try:
+        from salesforce_sync import clear_amazon_otp
+        clear_amazon_otp(otp_record_id)
+        print("[auth] Cleared OTP from Salesforce.")
+    except Exception as exc:
+        # Login itself already succeeded — surface a warning but don't abort.
+        print(f"[auth] Warning: failed to clear OTP in Salesforce: {exc}")
 
     return True
 
@@ -370,39 +336,20 @@ async def _handle_otp_challenge(page, headless: bool) -> bool:
 async def login(page, amazon_username: str, amazon_password: str, headless: bool) -> None:
     """
     Amazon password login:
-      1. Try going to /your-orders directly. If the session cookie is valid,
-         Amazon serves it. Otherwise it redirects to /ap/signin.
-      2. On the signin page, fill email → continue, then password → sign in.
+      1. Navigate directly to the signin page.
+      2. Fill email → continue, then password → sign in.
       3. Handle 2-step verification (OTP) if Amazon prompts for it.
       4. If Amazon shows a captcha, exit with a clear message (we never solve them).
     """
     print(f"[auth] Logging in to Amazon as …{mask(amazon_username)}")
     print(f"[auth] headless={headless}")
 
-    # Probe: try going straight to the orders page.
-    print(f"[auth] Probe: navigating to {AMAZON_ORDERS}")
-    await page.goto(AMAZON_ORDERS, wait_until="domcontentloaded")
+    print(f"[auth] Navigating to signin page…")
+    await page.goto(AMAZON_SIGNIN, wait_until="domcontentloaded")
     try:
         await page.wait_for_load_state("networkidle", timeout=10_000)
     except PlaywrightTimeoutError:
-        print("[auth] Probe: networkidle did not fire within 10s (continuing).")
-    await page.wait_for_timeout(1_500)
-    await _log_page_state(page, "after probe")
-
-    if await is_logged_in(page):
-        print("[auth] Already logged in via saved session.")
-        return
-
-    print("[auth] Saved session not valid — proceeding to email/password login.")
-
-    # Not logged in — Amazon redirected us to /ap/signin (or we land on a fresh signin page).
-    if "/ap/signin" not in page.url and "/ap/login" not in page.url:
-        print(f"[auth] Not on signin page — navigating to {AMAZON_SIGNIN}")
-        await page.goto(AMAZON_SIGNIN, wait_until="domcontentloaded")
-        try:
-            await page.wait_for_load_state("networkidle", timeout=10_000)
-        except PlaywrightTimeoutError:
-            print("[auth] Signin: networkidle did not fire within 10s (continuing).")
+        print("[auth] Signin: networkidle did not fire within 10s (continuing).")
     await _log_page_state(page, "on signin page")
 
     await _handle_captcha_block(page)
@@ -469,7 +416,7 @@ async def login(page, amazon_username: str, amazon_password: str, headless: bool
 
     # Step 3: OTP challenge (only on new device / suspicious login)
     print("[auth] Checking for OTP / 2-step verification screen…")
-    otp_entered = await _handle_otp_challenge(page, headless)
+    otp_entered = await _handle_otp_challenge(page)
     if not otp_entered:
         print("[auth] No OTP screen detected — continuing.")
 
@@ -837,14 +784,24 @@ async def run(num_orders: int, headless: bool) -> None:
         sys.exit(1)
 
     async with async_playwright() as pw:
-        # --no-sandbox / --disable-dev-shm-usage are required when Chromium
-        # runs as root inside a Docker container (e.g. on Render).
+        # --no-sandbox / --disable-dev-shm-usage are required inside Docker (Render).
+        # The extra flags reduce Chromium's memory footprint in headless mode.
         browser_args = []
         if headless:
             browser_args = [
                 "--no-sandbox",
                 "--disable-dev-shm-usage",
                 "--disable-gpu",
+                "--disable-extensions",
+                "--no-first-run",
+                "--disable-default-apps",
+                "--mute-audio",
+                "--hide-scrollbars",
+                "--disable-background-networking",
+                "--disable-sync",
+                "--disable-translate",
+                "--metrics-recording-only",
+                "--safebrowsing-disable-auto-update",
             ]
 
         browser = await pw.chromium.launch(
@@ -853,19 +810,23 @@ async def run(num_orders: int, headless: bool) -> None:
             args=browser_args,
         )
 
-        storage_state = str(AUTH_STATE_FILE) if AUTH_STATE_FILE.exists() else None
-        if storage_state:
-            print(f"[auth] Restoring session from {AUTH_STATE_FILE}")
-
         context = await browser.new_context(
-            storage_state=storage_state,
-            viewport={"width": 1400, "height": 900},
+            viewport={"width": 1280, "height": 800},
         )
         page = await context.new_page()
 
+        # Abort image/media/font requests — not needed for data extraction and
+        # they are the biggest contributors to Chromium's memory usage.
+        async def _block_heavy(route):
+            if route.request.resource_type in {"image", "media", "font"}:
+                await route.abort()
+            else:
+                await route.continue_()
+
+        await page.route("**/*", _block_heavy)
+
         # ---- Login ----
         await login(page, amazon_username, amazon_password, headless)
-        await save_auth(context)
 
         # ---- Navigate to orders ----
         print("[nav] Navigating to orders page…")
@@ -951,37 +912,60 @@ async def run(num_orders: int, headless: bool) -> None:
             if not cur.get("product_url_from_order") and p.get("product_url_from_order"):
                 cur["product_url_from_order"] = p["product_url_from_order"]
 
-        # ---- Per-product page visit to enrich price/image/availability ----
+        # ---- Per-product page visit + immediate Salesforce sync ----
+        # Check Salesforce availability once before the loop to avoid
+        # printing "skipped" N times.
+        try:
+            from salesforce_sync import (
+                sync_products as _sf_sync,
+                config_present as _sf_config_present,
+            )
+            _sf_available = _sf_config_present()
+            if not _sf_available:
+                missing = [
+                    k for k in ("SF_TOKEN_URL", "SF_CLIENT_ID", "SF_CLIENT_SECRET", "SF_API_ENDPOINT")
+                    if not (os.getenv(k) or "").strip()
+                ]
+                print(f"[salesforce] Sync disabled — missing env vars: {', '.join(missing)}")
+        except Exception as exc:
+            print(f"[salesforce] Import failed — sync disabled: {exc}")
+            _sf_available = False
+
+        scraped_at = datetime.now(tz=timezone.utc).astimezone().isoformat()
         titles = list(unique_by_title.keys())
+        report_products = []
         print(f"\n[products] Visiting {len(titles)} unique product page(s)…")
         for i, title in enumerate(titles, 1):
-            entry = unique_by_title[title]
+            entry = unique_by_title.pop(title)  # release as we go
             print(f"  [{i}/{len(titles)}] {title[:70]}")
-            details = await visit_product_page(
-                page, entry.get("product_url_from_order")
-            )
-            entry.update(details)
+            details = await visit_product_page(page, entry.get("product_url_from_order"))
+
+            date = entry.get("date")
+            product = {
+                "title": title,
+                "last_ordered_date": None if not date or date == "unknown" else date,
+                "number_of_times_purchased": title_counts[title],
+                "current_price": details["current_price"],
+                "product_url": details["product_url"],
+                "image_url": details["image_url"],
+                "category": entry.get("category", "Grocery"),
+                "availability": details["availability"] or "Unavailable",
+                "source": "Amazon",
+                "scraped_at": scraped_at,
+            }
+
+            if _sf_available:
+                try:
+                    _sf_sync([product])
+                except Exception as exc:
+                    print(f"  [salesforce] {title[:50]}: {exc}")
+
+            report_products.append(product)
 
         await context.close()
+        await browser.close()
 
-    # ---- Build report ----
-    scraped_at = datetime.now(tz=timezone.utc).astimezone().isoformat()
-    report_products = []
-    for title, p in unique_by_title.items():
-        date = p.get("date")
-        report_products.append({
-            "title": title,
-            "last_ordered_date": None if not date or date == "unknown" else date,
-            "number_of_times_purchased": title_counts[title],
-            "current_price": p.get("current_price"),
-            "product_url": p.get("product_url"),
-            "image_url": p.get("image_url"),
-            "category": p.get("category", "Grocery"),
-            "availability": p.get("availability") or "Unavailable",
-            "source": "Amazon",
-            "scraped_at": scraped_at,
-        })
-
+    # ---- Write report ----
     report = {
         "scraped_at": scraped_at,
         "orders_scanned": actual_count,
@@ -1006,14 +990,6 @@ async def run(num_orders: int, headless: bool) -> None:
             f"{p['number_of_times_purchased']:<4}  {price:<8}  "
             f"{str(p['category']):<12}  {p['availability']}"
         )
-
-    # ---- Push to Salesforce ----
-    # Best-effort: any failure here is logged but does not fail the scrape.
-    try:
-        from salesforce_sync import sync_products
-        sync_products(report_products)
-    except Exception as exc:
-        print(f"[salesforce] Sync failed: {exc}")
 
 
 def main() -> None:

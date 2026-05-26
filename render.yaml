@@ -12,8 +12,6 @@ services:
         sync: false
       - key: AMAZON_PASSWORD
         sync: false
-      - key: AMAZON_AUTH_STATE
-        sync: false          # paste contents of auth_state.json after first local scrape
 
       # ── Salesforce sync (optional — leave blank to skip sync) ────────────
       - key: SF_TOKEN_URL

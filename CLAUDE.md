@@ -77,12 +77,6 @@ designed for local development and cloud deployment on **Render** (Docker-based)
 | `SF_CLIENT_SECRET` | Connected App consumer secret |
 | `SF_API_ENDPOINT` | `https://<domain>.my.salesforce.com/services/data/v57.0/sobjects/Grocery_Product__c/` |
 
-### Cloud-only (Render dashboard — populated after first local run)
-
-| Variable | Description |
-|---|---|
-| `AMAZON_AUTH_STATE` | Full contents of `auth_state.json` after first successful local scrape |
-
 ### Optional overrides
 
 | Variable | Default |
@@ -134,34 +128,26 @@ python scrape_amazon_orders.py --headed=false   # headless
 
 ## High-Level Scraping Flow
 
-1. **Launch Chromium** (headed locally, headless in Docker) with a persistent
-   browser context.
-2. **Restore session** from `auth_state.json` if present.
-3. **Login** via email/password:
-   - Probe `https://www.amazon.in/your-orders` — if it serves the page, we're
-     already logged in.
-   - Otherwise go to `/ap/signin`, fill `AMAZON_USERNAME` → Continue, then
-     fill `AMAZON_PASSWORD` → Sign In.
+1. **Launch Chromium** (headed locally, headless in Docker).
+2. **Login** via email/password every run (no session is cached):
+   - Navigate directly to `/ap/signin`, fill `AMAZON_USERNAME` → Continue,
+     then fill `AMAZON_PASSWORD` → Sign In.
    - **Captcha**: if Amazon shows one, stop. Re-run locally headed to solve once.
-   - **2-step verification OTP**: if prompted in headed mode, the scraper
-     reads the OTP from stdin. In headless mode it exits with a clear error.
-4. **Save session** to `auth_state.json` (skips login on subsequent runs).
-5. **Navigate** to `https://www.amazon.in/your-orders/orders?orderFilter=months-6`.
-6. **Filter for Amazon Fresh orders** — first try the dropdown if it exposes a
+   - **2-step verification OTP**: poll `Purchase_Info__c.my_amazon_otp__c` in
+     Salesforce every 5 s for up to 3 minutes — works in both headed and
+     headless mode. Paste the OTP into that field and save; the scraper picks
+     it up, submits it, and immediately nulls the field.
+3. **Navigate** to `https://www.amazon.in/your-orders/orders?orderFilter=months-6`.
+4. **Filter for Amazon Fresh orders** — first try the dropdown if it exposes a
    Fresh option; otherwise filter client-side by matching the order card text
    for `"Amazon Fresh"`, `"Sold by: Amazon Fresh"`, or `"Fulfilled by Amazon Fresh"`.
-7. **Paginate** until `num_orders` Fresh orders are collected (max 5 pages).
-8. **For each Fresh order**: visit its `/gp/your-account/order-details` page,
+5. **Paginate** until `num_orders` Fresh orders are collected (max 5 pages).
+6. **For each Fresh order**: visit its `/gp/your-account/order-details` page,
    extract every product row's title + product-page URL, and the order date.
-9. **For each unique product**: visit its product page once to capture
-   `current_price`, `product_url`, `image_url`, and `availability`.
-10. **Aggregate** by product title; write `orders_report.json`; print table.
-11. **Sync to Salesforce** (best-effort):
-    - Authenticate via `client_credentials` against `SF_TOKEN_URL`.
-    - For each unique title, PATCH `Grocery_Product__c/title__c/<title>` with
-      `source__c="Amazon"`.
-    - Existing records are updated; non-matching titles are skipped.
-    - Any Salesforce error is logged but does not fail the scrape.
+7. **For each unique product**: visit its product page once to capture
+   `current_price`, `product_url`, `image_url`, and `availability`, then
+   immediately PATCH the matching `Grocery_Product__c` record in Salesforce.
+8. **Write** `orders_report.json` and print the summary table.
 
 ## Selector Strategy
 
@@ -212,47 +198,37 @@ When a selector fails:
 ### How it works
 
 - Render builds the `Dockerfile` (Python 3.11-slim + Playwright Chromium).
-- On container start, `app.py` reads `AMAZON_AUTH_STATE` and writes it to
-  `auth_state.json` (Render's filesystem is ephemeral — it resets on every
-  restart).
+- Every scrape does a full login (email + password). No session is cached or
+  persisted — no auth state env var needed.
 - Scraping runs headless inside the container.
 
 ### Deploy steps
 
 1. Push code to GitHub.
-2. **First, run locally in headed mode** (`python scrape_amazon_orders.py
-   --headed=true --orders=1`) to capture `auth_state.json`. Solve any captcha
-   or 2-step verification challenge during this run.
-3. Render → **New Web Service** → connect repo → auto-detects `Dockerfile`.
-4. Add environment variables in Render dashboard (see table above).
-5. Set `AMAZON_AUTH_STATE` to the full contents of the local `auth_state.json`.
-6. After the first successful scrape on Render, the logs print a fresh
-   `auth_state.json` content — copy that value back into `AMAZON_AUTH_STATE`
-   to extend the session lifespan.
+2. Render → **New Web Service** → connect repo → auto-detects `Dockerfile`.
+3. Add environment variables in Render dashboard (see table above).
+4. Deploy. Trigger a scrape via `POST /api/products`.
+5. If Amazon asks for OTP, watch the Render logs for the `[auth] ACTION REQUIRED`
+   line, then paste the code into `Purchase_Info__c.my_amazon_otp__c` in
+   Salesforce. The scraper will pick it up within 5 seconds.
 
 ## Amazon login pitfalls
 
-- **Amazon is more aggressive than Flipkart at bot detection.** The first
-  login from any new IP/device usually triggers a captcha and/or 2-step
-  verification email. Both require a one-time headed local run to clear.
-- **Sessions persist.** After a successful login, the cookies in
-  `auth_state.json` typically remain valid for weeks. Refresh the Render env
-  var whenever the scraper starts erroring with "Login did not complete".
+- **Amazon is aggressive at bot detection.** The first login from a new
+  IP/device usually triggers a captcha and/or OTP. Captchas require a headed
+  local run to solve by hand. OTPs are handled via the Salesforce bridge (see below).
+- **No session caching.** Every scrape does a full login. Amazon may ask for
+  OTP on any run if it considers the request suspicious.
 - **Wrong password / locked account.** Amazon shows the same "Sign in" page
   after a bad submit. The scraper detects this and exits with a screenshot.
-- **`AMAZON_AUTH_STATE` env-var quoting on Render.** Paste the raw JSON
-  contents into the env var — do NOT wrap them in extra quotes or escape
-  characters.
 - **Fresh orders may be empty.** If your account has no recent Amazon Fresh
   orders, the report is written with `products: []` rather than erroring —
   the Salesforce sync then no-ops cleanly.
 
-### OTP via Salesforce (headless 2FA bridge)
+### OTP via Salesforce (2FA bridge — all modes)
 
-When Amazon presents the 2-step verification (OTP) screen in headless mode
-— typical the first time a brand-new IP/device combination tries to log in
-— the scraper cannot read stdin. Instead it uses Salesforce as a manual
-side-channel:
+When Amazon presents the 2-step verification (OTP) screen — in any mode,
+headed or headless — the scraper uses Salesforce as a side-channel:
 
 1. The scraper polls `Purchase_Info__c.my_amazon_otp__c` every 5 seconds
    for up to 3 minutes.
@@ -262,8 +238,6 @@ side-channel:
    nulls the field so the next run does not see a stale OTP.
 4. If 3 minutes elapse with the field empty, the scraper exits with a
    screenshot and a clear error so the run can be retried.
-
-Headed local runs are unchanged — they still prompt for the OTP on stdin.
 
 Connected App requirements: the "Run As" user must have **Read** and
 **Edit** permission on `Purchase_Info__c` and the `my_amazon_otp__c`

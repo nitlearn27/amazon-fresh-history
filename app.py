@@ -38,44 +38,6 @@ load_dotenv()
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# Startup: hydrate ephemeral files from environment variables.
-# Render's filesystem resets on every deploy/restart, so credentials that
-# were obtained locally are stored as env vars and written back here.
-# ---------------------------------------------------------------------------
-
-def _hydrate_file(env_key: str, file_path: Path) -> None:
-    """Write env_key's value to file_path. Verbose logging so Render logs show status."""
-    value = os.getenv(env_key, "").strip()
-    if not value:
-        print(f"[init] {env_key}: NOT SET — {file_path.name} will not be created.")
-        return
-    if file_path.exists():
-        print(f"[init] {env_key}: skipping — {file_path.name} already exists.")
-        return
-    try:
-        file_path.write_text(value, encoding="utf-8")
-        try:
-            parsed = json.loads(value)
-            keys = list(parsed.keys()) if isinstance(parsed, dict) else []
-            print(
-                f"[init] {env_key}: wrote {file_path.name} "
-                f"({len(value)} chars, JSON keys: {keys})"
-            )
-        except json.JSONDecodeError as je:
-            print(
-                f"[init] {env_key}: wrote {file_path.name} but content is NOT valid JSON: {je}\n"
-                f"        First 80 chars: {value[:80]!r}"
-            )
-    except Exception as exc:
-        print(f"[init] {env_key}: ERROR writing {file_path.name}: {exc}")
-
-
-print("=" * 60)
-print("[init] Hydrating credentials from environment variables…")
-_hydrate_file("AMAZON_AUTH_STATE", Path("auth_state.json"))
-print("=" * 60)
-
-# ---------------------------------------------------------------------------
 # Scrape state
 # ---------------------------------------------------------------------------
 
@@ -90,7 +52,6 @@ _state = {
 
 def _run_scrape(num_orders: int) -> None:
     """Blocking function executed in a background thread."""
-    global _state
     headless = os.getenv("HEADLESS", "true").lower() in ("true", "1", "yes")
     try:
         from scrape_amazon_orders import run
@@ -100,14 +61,6 @@ def _run_scrape(num_orders: int) -> None:
         if report_path.exists():
             _state["last_result"] = json.loads(report_path.read_text())
             _state["error"] = None
-
-            # Log auth_state.json content so the user can update AMAZON_AUTH_STATE
-            auth_path = Path("auth_state.json")
-            if auth_path.exists():
-                print("\n[deploy] Copy the value below into the AMAZON_AUTH_STATE "
-                      "environment variable on Render to persist the Amazon session:\n")
-                print(auth_path.read_text())
-                print()
         else:
             _state["error"] = "Scrape finished but orders_report.json was not created."
 

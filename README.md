@@ -41,26 +41,25 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
-Copy `.env.example` to `.env` and fill in:
+Copy `.env.example` to `.env` and fill in the required values.
 
-- `AMAZON_USERNAME` — your Amazon.in login email or phone
-- `AMAZON_PASSWORD` — your Amazon.in password
-- (optional) `SF_TOKEN_URL`, `SF_CLIENT_ID`, `SF_CLIENT_SECRET`, `SF_API_ENDPOINT`
+### Captcha
 
-### First run — MUST be headed
+If Amazon shows a captcha, the scrape stops with a screenshot and a clear
+error. Re-run locally in headed mode (`--headed=true`) to solve it once by
+hand; captchas do not recur once Amazon trusts the browser fingerprint.
 
-Amazon nearly always presents a captcha or 2-step verification email the first
-time it sees a new browser. Run the scraper in headed mode once so you can
-clear the challenge by hand:
+### OTP / 2-step verification
 
-```bash
-python scrape_amazon_orders.py --headed=true --orders=1
-```
+Every run does a fresh login (no session is cached). Amazon may ask for a
+2-step verification code. When it does, the scraper polls
+`Purchase_Info__c.my_amazon_otp__c` in Salesforce every 5 s for up to
+3 minutes — paste the OTP Amazon sent into that field and save; the scraper
+picks it up automatically, submits it, and immediately blanks the field.
 
-After this completes, `auth_state.json` is written. All subsequent runs reuse
-that session and skip the login flow entirely.
+This works the same way in headed local runs and headless Render runs.
 
-### Salesforce Connected App (optional)
+### Salesforce Connected App
 
 If you want sync, create a Connected App with:
 
@@ -114,35 +113,31 @@ python salesforce_sync.py
 The repo is Docker-based and ready for Render's "New Web Service → connect repo"
 flow. `render.yaml` declares every env var the service expects.
 
-### One-time steps
+### Deploy steps
 
-1. **Run the scraper locally in headed mode** at least once to clear any
-   captcha/2-step verification and capture `auth_state.json`.
-2. **Push to GitHub.**
-3. **Render → New → Web Service → connect repo.** Render auto-detects
+1. **Push to GitHub.**
+2. **Render → New → Web Service → connect repo.** Render auto-detects
    `Dockerfile` and `render.yaml`.
-4. **Set environment variables** in the Render dashboard:
+3. **Set environment variables** in the Render dashboard:
 
-   | Variable             | Value                                                       |
-   |----------------------|-------------------------------------------------------------|
-   | `AMAZON_USERNAME`    | your Amazon.in login email/phone                            |
-   | `AMAZON_PASSWORD`    | your Amazon.in password                                     |
-   | `AMAZON_AUTH_STATE`  | **paste the entire contents of your local `auth_state.json`** |
-   | `SF_TOKEN_URL`       | (optional) Salesforce OAuth token endpoint                  |
-   | `SF_CLIENT_ID`       | (optional) Connected App consumer key                       |
-   | `SF_CLIENT_SECRET`   | (optional) Connected App consumer secret                    |
-   | `SF_API_ENDPOINT`    | (optional) `…/services/data/v57.0/sobjects/Grocery_Product__c/` |
-   | `HEADLESS`           | `true` (already set in `render.yaml`)                       |
+   | Variable          | Value                                                            |
+   |-------------------|------------------------------------------------------------------|
+   | `AMAZON_USERNAME` | your Amazon.in login email/phone                                 |
+   | `AMAZON_PASSWORD` | your Amazon.in password                                          |
+   | `SF_TOKEN_URL`    | Salesforce OAuth token endpoint                                  |
+   | `SF_CLIENT_ID`    | Connected App consumer key                                       |
+   | `SF_CLIENT_SECRET`| Connected App consumer secret                                    |
+   | `SF_API_ENDPOINT` | `…/services/data/v57.0/sobjects/Grocery_Product__c/`             |
+   | `HEADLESS`        | `true` (already set in `render.yaml`)                            |
 
-5. **Deploy.** Trigger one scrape via `POST /api/products`. After it finishes,
-   Render logs print the fresh `auth_state.json` content — copy it back into
-   the `AMAZON_AUTH_STATE` env var to extend the session lifespan.
+4. **Deploy.** Trigger a scrape via `POST /api/products`.
 
-### How session persistence works on Render
+### OTP on Render
 
-Render's filesystem is ephemeral — `auth_state.json` is wiped on every restart.
-`app.py` rehydrates it from `AMAZON_AUTH_STATE` on container startup, so the
-scraper finds it exactly where it expects.
+Each scrape does a full login. If Amazon asks for a 2-step verification code,
+watch the Render logs for the `[auth] ACTION REQUIRED` line, then paste the
+OTP into `Purchase_Info__c.my_amazon_otp__c` in Salesforce. The scraper picks
+it up within 5 seconds, submits it, and continues automatically.
 
 ---
 
@@ -186,4 +181,4 @@ orders, repeated on every row of the same title.
 - **Captchas are not bypassed.** If Amazon shows one, the scrape stops with a
   clear error and a screenshot.
 - **Single tenant.** One Amazon account per deployment.
-- Never commit `.env` or `auth_state.json`. Already in `.gitignore`.
+- Never commit `.env`. Already in `.gitignore`.
