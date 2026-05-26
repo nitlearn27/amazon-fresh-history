@@ -172,6 +172,29 @@ def _extract_date_from_text(text: str) -> str:
 # Login flow
 # ---------------------------------------------------------------------------
 
+async def _log_page_state(page, label: str) -> None:
+    """Verbose breadcrumb so failures are easy to triage from the raw log.
+    Prints the URL, page title, and any visible heading text after each major
+    transition. Never raises — diagnostic-only."""
+    try:
+        url = page.url
+    except Exception:
+        url = "<unknown>"
+    try:
+        title = (await page.title()) or ""
+    except Exception:
+        title = ""
+    try:
+        heading = (await page.locator("h1, h2").first.inner_text(timeout=500)) or ""
+    except Exception:
+        heading = ""
+    print(f"[trace] {label}: url={url!r}")
+    if title:
+        print(f"[trace] {label}: title={title!r}")
+    if heading:
+        print(f"[trace] {label}: heading={heading[:120]!r}")
+
+
 async def save_auth(context) -> None:
     storage = await context.storage_state()
     AUTH_STATE_FILE.write_text(json.dumps(storage, indent=2), encoding="utf-8")
@@ -182,11 +205,14 @@ async def is_logged_in(page) -> bool:
     """We're logged in iff the orders page renders without redirecting to /ap/signin."""
     url = page.url.lower()
     if "/ap/signin" in url or "/ap/login" in url:
+        print(f"[auth] is_logged_in=False — URL is on signin page ({page.url})")
         return False
     try:
         await page.wait_for_selector(SELECTORS["logged_in_indicator"], timeout=4_000)
+        print(f"[auth] is_logged_in=True — account nav element present at {page.url}")
         return True
     except PlaywrightTimeoutError:
+        print(f"[auth] is_logged_in=False — no account nav element at {page.url}")
         return False
 
 
@@ -208,50 +234,136 @@ async def _handle_captcha_block(page) -> None:
         sys.exit(1)
 
 
+async def _poll_salesforce_for_otp(
+    poll_interval_seconds: int = 5,
+    max_total_seconds: int = 180,
+) -> tuple[str, str] | None:
+    """Headless OTP source: poll Salesforce Purchase_Info__c.my_amazon_otp__c
+    until a value appears or we time out. Returns (record_id, otp) on success,
+    None on timeout. Transport errors are logged and the loop continues —
+    momentary Salesforce outages should not kill an in-progress 2FA window."""
+    try:
+        from salesforce_sync import (
+            OTP_FIELD,
+            OTP_OBJECT,
+            SalesforceError,
+            config_present,
+            fetch_amazon_otp,
+        )
+    except Exception as exc:
+        print(f"[auth] Could not import Salesforce OTP bridge: {exc}")
+        return None
+
+    if not config_present():
+        print(
+            "[auth] Salesforce env vars are not set (SF_TOKEN_URL / SF_CLIENT_ID /"
+            " SF_CLIENT_SECRET / SF_API_ENDPOINT) — cannot poll for OTP."
+        )
+        return None
+
+    print(
+        f"[auth] Amazon prompted for OTP. Polling Salesforce "
+        f"{OTP_OBJECT}.{OTP_FIELD} every {poll_interval_seconds}s "
+        f"(max {max_total_seconds}s)…"
+    )
+    print(
+        f"[auth] ACTION REQUIRED: open Salesforce → {OTP_OBJECT} → set "
+        f"{OTP_FIELD} to the OTP that Amazon just emailed/SMS'd, then save."
+    )
+    max_attempts = max(1, max_total_seconds // poll_interval_seconds)
+    for attempt in range(1, max_attempts + 1):
+        elapsed = (attempt - 1) * poll_interval_seconds
+        try:
+            result = fetch_amazon_otp()
+            poll_outcome = "value-present" if result is not None else "empty"
+        except SalesforceError as exc:
+            print(f"[auth] Salesforce OTP poll attempt {attempt}/{max_attempts} (t={elapsed}s) failed: {exc}")
+            result = None
+            poll_outcome = "error"
+        except Exception as exc:
+            print(f"[auth] Salesforce OTP poll attempt {attempt}/{max_attempts} (t={elapsed}s) unexpected error: {exc}")
+            result = None
+            poll_outcome = "error"
+        if result is not None:
+            print(f"[auth] OTP received from Salesforce on attempt {attempt}/{max_attempts} (t={elapsed}s).")
+            return result
+        # Log progress every attempt so the user can confirm the loop is alive.
+        print(
+            f"[auth] Salesforce OTP poll attempt {attempt}/{max_attempts} "
+            f"(t={elapsed}s) → {poll_outcome}; sleeping {poll_interval_seconds}s…"
+        )
+        if attempt < max_attempts:
+            await asyncio.sleep(poll_interval_seconds)
+    return None
+
+
 async def _handle_otp_challenge(page, headless: bool) -> bool:
-    """If Amazon asks for an OTP (2-step verification), prompt the user via stdin
-    when headed; bail out on a headless server. Returns True iff we entered an OTP."""
+    """If Amazon asks for an OTP (2-step verification), source the code:
+      • Headless → poll Salesforce Purchase_Info__c.my_amazon_otp__c.
+      • Headed → prompt the user via stdin.
+    Returns True iff we entered an OTP."""
     otp_input = page.locator(SELECTORS["otp_input"]).first
     try:
         await otp_input.wait_for(state="visible", timeout=4_000)
+        print("[auth] OTP input detected — Amazon is asking for 2-step verification.")
+        await _log_page_state(page, "OTP screen")
     except PlaywrightTimeoutError:
         return False
 
-    if headless:
-        screenshot_path = Path("amazon_login_debug.png")
-        await page.screenshot(path=str(screenshot_path), full_page=True)
-        print(
-            "\n[error] Amazon requested a 2-step verification OTP, but this run is headless.\n"
-            "  • Re-run locally in HEADED mode and complete the OTP challenge by hand.\n"
-            "  • That writes a fresh auth_state.json which you can paste into the\n"
-            "    AMAZON_AUTH_STATE env var on Render.\n"
-            f"  • Screenshot: {screenshot_path.resolve()}\n"
-        )
-        sys.exit(1)
+    otp_record_id: str | None = None
 
-    print("\n[auth] Amazon is asking for a 2-step verification OTP.")
-    print("[auth] Check the email or SMS Amazon just sent and paste the code below.")
-    try:
-        otp = input("       OTP: ").strip()
-    except EOFError:
-        print("[error] No interactive stdin available — cannot prompt for OTP.")
-        sys.exit(1)
+    if headless:
+        polled = await _poll_salesforce_for_otp()
+        if polled is None:
+            screenshot_path = Path("amazon_login_debug.png")
+            await page.screenshot(path=str(screenshot_path), full_page=True)
+            print(
+                "\n[error] No OTP appeared in Salesforce within the 3-minute window.\n"
+                "  • Set Purchase_Info__c.my_amazon_otp__c to the OTP that Amazon\n"
+                "    just emailed/SMS'd, then re-trigger the scrape.\n"
+                f"  • Screenshot: {screenshot_path.resolve()}\n"
+            )
+            sys.exit(1)
+        otp_record_id, otp = polled
+    else:
+        print("\n[auth] Amazon is asking for a 2-step verification OTP.")
+        print("[auth] Check the email or SMS Amazon just sent and paste the code below.")
+        try:
+            otp = input("       OTP: ").strip()
+        except EOFError:
+            print("[error] No interactive stdin available — cannot prompt for OTP.")
+            sys.exit(1)
+
     if not re.fullmatch(r"\d{4,8}", otp):
         print(f"[error] {otp!r} does not look like a numeric OTP. Aborting.")
         sys.exit(1)
 
     await otp_input.fill(otp)
+    print(f"[auth] OTP filled into Amazon ({len(otp)} digits). Submitting…")
     submit = page.locator(SELECTORS["otp_submit"]).first
     try:
         await submit.wait_for(state="visible", timeout=5_000)
         await submit.click()
+        print("[auth] Clicked OTP submit button.")
     except PlaywrightTimeoutError:
         await otp_input.press("Enter")
+        print("[auth] OTP submit button not visible — pressed Enter on OTP field.")
 
     try:
         await page.wait_for_load_state("networkidle", timeout=15_000)
     except PlaywrightTimeoutError:
-        pass
+        print("[auth] Post-OTP: networkidle did not fire within 15s (continuing).")
+    await _log_page_state(page, "after OTP submit")
+
+    if otp_record_id is not None:
+        try:
+            from salesforce_sync import clear_amazon_otp
+            clear_amazon_otp(otp_record_id)
+            print("[auth] Cleared OTP from Salesforce.")
+        except Exception as exc:
+            # Login itself already succeeded — surface a warning but don't abort.
+            print(f"[auth] Warning: failed to clear OTP in Salesforce: {exc}")
+
     return True
 
 
@@ -265,26 +377,33 @@ async def login(page, amazon_username: str, amazon_password: str, headless: bool
       4. If Amazon shows a captcha, exit with a clear message (we never solve them).
     """
     print(f"[auth] Logging in to Amazon as …{mask(amazon_username)}")
+    print(f"[auth] headless={headless}")
 
     # Probe: try going straight to the orders page.
+    print(f"[auth] Probe: navigating to {AMAZON_ORDERS}")
     await page.goto(AMAZON_ORDERS, wait_until="domcontentloaded")
     try:
         await page.wait_for_load_state("networkidle", timeout=10_000)
     except PlaywrightTimeoutError:
-        pass
+        print("[auth] Probe: networkidle did not fire within 10s (continuing).")
     await page.wait_for_timeout(1_500)
+    await _log_page_state(page, "after probe")
 
     if await is_logged_in(page):
         print("[auth] Already logged in via saved session.")
         return
 
+    print("[auth] Saved session not valid — proceeding to email/password login.")
+
     # Not logged in — Amazon redirected us to /ap/signin (or we land on a fresh signin page).
     if "/ap/signin" not in page.url and "/ap/login" not in page.url:
+        print(f"[auth] Not on signin page — navigating to {AMAZON_SIGNIN}")
         await page.goto(AMAZON_SIGNIN, wait_until="domcontentloaded")
         try:
             await page.wait_for_load_state("networkidle", timeout=10_000)
         except PlaywrightTimeoutError:
-            pass
+            print("[auth] Signin: networkidle did not fire within 10s (continuing).")
+    await _log_page_state(page, "on signin page")
 
     await _handle_captcha_block(page)
 
@@ -309,9 +428,12 @@ async def login(page, amazon_username: str, amazon_password: str, headless: bool
     try:
         await continue_btn.wait_for(state="visible", timeout=5_000)
         await continue_btn.click()
+        print("[auth] Clicked Continue.")
     except PlaywrightTimeoutError:
         await email_input.press("Enter")
+        print("[auth] Continue button not visible — pressed Enter on email field.")
     await page.wait_for_timeout(2_000)
+    await _log_page_state(page, "after Continue")
 
     await _handle_captcha_block(page)
 
@@ -338,12 +460,18 @@ async def login(page, amazon_username: str, amazon_password: str, headless: bool
     try:
         await signin_btn.wait_for(state="visible", timeout=5_000)
         await signin_btn.click()
+        print("[auth] Clicked Sign-In.")
     except PlaywrightTimeoutError:
         await password_input.press("Enter")
+        print("[auth] Sign-In button not visible — pressed Enter on password field.")
     await page.wait_for_timeout(3_000)
+    await _log_page_state(page, "after Sign-In")
 
     # Step 3: OTP challenge (only on new device / suspicious login)
-    await _handle_otp_challenge(page, headless)
+    print("[auth] Checking for OTP / 2-step verification screen…")
+    otp_entered = await _handle_otp_challenge(page, headless)
+    if not otp_entered:
+        print("[auth] No OTP screen detected — continuing.")
 
     # Step 4: post-login captcha (rare but possible)
     await _handle_captcha_block(page)
@@ -351,7 +479,8 @@ async def login(page, amazon_username: str, amazon_password: str, headless: bool
     try:
         await page.wait_for_load_state("networkidle", timeout=15_000)
     except PlaywrightTimeoutError:
-        pass
+        print("[auth] Post-signin: networkidle did not fire within 15s (continuing).")
+    await _log_page_state(page, "post-login final state")
 
     if not await is_logged_in(page):
         screenshot_path = Path("amazon_login_debug.png")

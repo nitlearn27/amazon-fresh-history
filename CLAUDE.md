@@ -247,6 +247,30 @@ When a selector fails:
   orders, the report is written with `products: []` rather than erroring —
   the Salesforce sync then no-ops cleanly.
 
+### OTP via Salesforce (headless 2FA bridge)
+
+When Amazon presents the 2-step verification (OTP) screen in headless mode
+— typical the first time a brand-new IP/device combination tries to log in
+— the scraper cannot read stdin. Instead it uses Salesforce as a manual
+side-channel:
+
+1. The scraper polls `Purchase_Info__c.my_amazon_otp__c` every 5 seconds
+   for up to 3 minutes.
+2. You watch the email/SMS Amazon just sent, then paste the OTP into that
+   field on the single `Purchase_Info__c` record and save.
+3. The scraper picks up the value, types it into Amazon, and immediately
+   nulls the field so the next run does not see a stale OTP.
+4. If 3 minutes elapse with the field empty, the scraper exits with a
+   screenshot and a clear error so the run can be retried.
+
+Headed local runs are unchanged — they still prompt for the OTP on stdin.
+
+Connected App requirements: the "Run As" user must have **Read** and
+**Edit** permission on `Purchase_Info__c` and the `my_amazon_otp__c`
+field, in addition to the existing `Grocery_Product__c` permissions. No
+new env vars — the bridge reuses `SF_TOKEN_URL`, `SF_CLIENT_ID`,
+`SF_CLIENT_SECRET`, `SF_API_ENDPOINT`.
+
 ## Salesforce sync notes
 
 - Auth uses OAuth 2.0 `client_credentials` flow (Connected App with the "Run As"

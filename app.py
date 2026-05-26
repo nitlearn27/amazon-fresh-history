@@ -21,11 +21,14 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Force UTF-8 stdout/stderr so unicode characters print on Windows
+# Force UTF-8 stdout/stderr so unicode characters print on Windows, AND enable
+# line buffering so every print() lands in the log file/stream immediately —
+# without this, redirected stdout (e.g. `python app.py > app.log`) is block-
+# buffered and the scraper's progress lines never show up in real time.
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 if hasattr(sys.stderr, "reconfigure"):
-    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
 
 from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, redirect, request

@@ -1,5 +1,6 @@
 .env
 auth_state.json
+auth_state.json.bak.*
 credentials.json
 browser_profile/
 __pycache__/

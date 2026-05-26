@@ -52,6 +52,11 @@ AVAILABILITY_FIELD = "availability__c"
 SOURCE_FIELD = "source__c"
 SCRAPED_AT_FIELD = "scraped_at__c"
 
+# Side-channel object used to bridge Amazon's 2-step verification OTP from a
+# human (Salesforce UI) to a headless scraper. See fetch_amazon_otp.
+OTP_OBJECT = "Purchase_Info__c"
+OTP_FIELD = "my_amazon_otp__c"
+
 _REQUIRED_ENV = ("SF_TOKEN_URL", "SF_CLIENT_ID", "SF_CLIENT_SECRET", "SF_API_ENDPOINT")
 _TOKEN_CACHE: dict[str, str] = {}
 
@@ -62,6 +67,12 @@ class SalesforceError(RuntimeError):
 
 def _config_present() -> bool:
     return all((os.getenv(k) or "").strip() for k in _REQUIRED_ENV)
+
+
+def config_present() -> bool:
+    """Public alias of _config_present() so callers outside this module can
+    cheaply check whether the OTP / sync features have credentials available."""
+    return _config_present()
 
 
 def _env(name: str) -> str:
@@ -269,6 +280,51 @@ def sync_products(products: Iterable[dict]) -> dict:
         f"{stats['errors']} errors."
     )
     return stats
+
+
+def fetch_amazon_otp() -> tuple[str, str] | None:
+    """Query Purchase_Info__c for a non-null OTP value.
+
+    Returns (record_id, otp) when a record has my_amazon_otp__c set, else None.
+    Raises SalesforceError on transport/auth failures so the caller can decide
+    whether to retry or abort the polling loop."""
+    soql = (
+        f"SELECT Id, {OTP_FIELD} FROM {OTP_OBJECT} "
+        f"WHERE {OTP_FIELD} != null LIMIT 1"
+    )
+    url = f"{_instance_root()}{_api_version_path()}/query?q={quote(soql, safe='')}"
+    resp = _request("GET", url)
+    if resp.status_code != 200:
+        raise SalesforceError(
+            f"OTP query failed: {resp.status_code} {resp.text[:300]}"
+        )
+    records = resp.json().get("records") or []
+    print(f"[salesforce] OTP query → HTTP {resp.status_code}, records={len(records)}")
+    if not records:
+        return None
+    rec = records[0]
+    otp = (rec.get(OTP_FIELD) or "").strip()
+    if not otp:
+        print(f"[salesforce] OTP record {rec.get('Id')} found but {OTP_FIELD} is empty.")
+        return None
+    print(f"[salesforce] OTP found on record {rec['Id']} (length={len(otp)}).")
+    return rec["Id"], otp
+
+
+def clear_amazon_otp(record_id: str) -> None:
+    """Null out Purchase_Info__c.my_amazon_otp__c for the given record so the
+    next run does not pick up a stale OTP."""
+    url = (
+        f"{_instance_root()}{_api_version_path()}"
+        f"/sobjects/{OTP_OBJECT}/{record_id}"
+    )
+    print(f"[salesforce] Clearing {OTP_FIELD} on record {record_id}…")
+    resp = _request("PATCH", url, json={OTP_FIELD: None})
+    if resp.status_code not in (200, 204):
+        raise SalesforceError(
+            f"Clear OTP failed: {resp.status_code} {resp.text[:300]}"
+        )
+    print(f"[salesforce] Clear OTP → HTTP {resp.status_code}.")
 
 
 def _cli() -> None:
