@@ -59,13 +59,29 @@ picks it up automatically, submits it, and immediately blanks the field.
 
 This works the same way in headed local runs and headless Render runs.
 
+### Delivery location (Fresh availability)
+
+Amazon Fresh prices and stock are **per delivery location**. With no location
+set, every Fresh product page reports *"currently unavailable"* and no price.
+So right after login the scraper sets the "Deliver to" location:
+
+1. It first tries to select the saved address whose text contains
+   `DELIVERY_ADDRESS_PREFIX` (default `82, Flat No 6`).
+2. If no matching saved address is found, it enters `DELIVERY_PINCODE`
+   (default `560094`).
+
+Both are optional env vars — the built-in defaults work without configuration.
+Set `DELIVERY_ADDRESS_PREFIX` to a substring unique to the address you want.
+
 ### Salesforce Connected App
 
 If you want sync, create a Connected App with:
 
 - **OAuth flow:** Client Credentials
 - **Scopes:** `api`, `refresh_token`
-- **Run-as user** with read/update access to `Grocery_Product__c`
+- **Run-as user** with read/update access to `Grocery_Product__c` (including the
+  `last_purchased_price__c` field) and read/edit on `Purchase_Info__c.my_amazon_otp__c`
+  for the OTP bridge.
 
 Then fill the four `SF_*` env vars in `.env`. If any are missing, sync is
 silently skipped and the scrape still completes.
@@ -120,15 +136,21 @@ flow. `render.yaml` declares every env var the service expects.
    `Dockerfile` and `render.yaml`.
 3. **Set environment variables** in the Render dashboard:
 
-   | Variable          | Value                                                            |
-   |-------------------|------------------------------------------------------------------|
-   | `AMAZON_USERNAME` | your Amazon.in login email/phone                                 |
-   | `AMAZON_PASSWORD` | your Amazon.in password                                          |
-   | `SF_TOKEN_URL`    | Salesforce OAuth token endpoint                                  |
-   | `SF_CLIENT_ID`    | Connected App consumer key                                       |
-   | `SF_CLIENT_SECRET`| Connected App consumer secret                                    |
-   | `SF_API_ENDPOINT` | `…/services/data/v57.0/sobjects/Grocery_Product__c/`             |
-   | `HEADLESS`        | `true` (already set in `render.yaml`)                            |
+   | Variable                  | Value                                                            |
+   |---------------------------|------------------------------------------------------------------|
+   | `AMAZON_USERNAME`         | your Amazon.in login email/phone                                 |
+   | `AMAZON_PASSWORD`         | your Amazon.in password                                          |
+   | `SF_TOKEN_URL`            | Salesforce OAuth token endpoint                                  |
+   | `SF_CLIENT_ID`            | Connected App consumer key                                       |
+   | `SF_CLIENT_SECRET`        | Connected App consumer secret                                    |
+   | `SF_API_ENDPOINT`         | `…/services/data/v57.0/sobjects/Grocery_Product__c/`             |
+   | `HEADLESS`                | `true` (already set in `render.yaml`)                            |
+   | `ORDERS_TO_SCRAPE`        | _(optional)_ default order count; `10` in `render.yaml`          |
+   | `DELIVERY_ADDRESS_PREFIX` | _(optional)_ saved-address substring to deliver to; default `82, Flat No 6` |
+   | `DELIVERY_PINCODE`        | _(optional)_ pincode fallback; `560094` in `render.yaml`         |
+
+   Only `AMAZON_*` are strictly required to deploy. The `SF_*` block enables
+   Salesforce sync + the OTP bridge; the rest have working defaults.
 
 4. **Deploy.** Trigger a scrape via `POST /api/products`.
 
@@ -155,6 +177,7 @@ it up within 5 seconds, submits it, and continues automatically.
       "last_ordered_date": "2026-05-12",
       "number_of_times_purchased": 2,
       "current_price": 89.0,
+      "last_purchased_price": 85.0,
       "product_url": "https://www.amazon.in/dp/B0...",
       "image_url": "https://m.media-amazon.com/images/I/...",
       "category": "Grocery",
@@ -166,8 +189,15 @@ it up within 5 seconds, submits it, and continues automatically.
 }
 ```
 
-`number_of_times_purchased` is the per-product aggregate across all scanned
-orders, repeated on every row of the same title.
+- `number_of_times_purchased` is the per-product aggregate across all scanned
+  orders, repeated on every row of the same title.
+- `current_price` is the live price read from the product page; `availability`
+  is `"Available"` whenever that page shows a price, else `"Unavailable"`.
+- `last_purchased_price` is the price actually paid in the **most recent** order
+  containing the product (read from the order item list, not the product page).
+
+These map to `Grocery_Product__c` fields `current_price__c`,
+`availability__c`, and `last_purchased_price__c` respectively.
 
 ---
 

@@ -4,6 +4,12 @@ __pycache__/
 *.pyc
 browser_profile/
 auth_state.json
+auth_state.json.bak.*
 orders_report.json
+*.png
 *.md
+.git/
 .gitignore
+.dockerignore
+.claude/
+.DS_Store

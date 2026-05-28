@@ -26,3 +26,17 @@ services:
       # ── Runtime ──────────────────────────────────────────────────────────
       - key: HEADLESS
         value: "true"
+      # Default number of recent Fresh orders to scrape (POST body overrides).
+      - key: ORDERS_TO_SCRAPE
+        value: "10"
+
+      # ── Delivery location (sets Amazon "Deliver to" so Fresh items show ───
+      #    correct availability/price) ────────────────────────────────────
+      # Preferred saved address (substring match). Account-specific, so set it
+      # in the dashboard; if left unset the code falls back to its built-in
+      # default. Only used when a matching saved address exists for the account.
+      - key: DELIVERY_ADDRESS_PREFIX
+        sync: false
+      # Pincode fallback used when no saved address matches the prefix above.
+      - key: DELIVERY_PINCODE
+        value: "560094"

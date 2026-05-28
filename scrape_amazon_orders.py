@@ -43,6 +43,13 @@ SELECTORS = {
     ),
     # Logged-in marker on amazon.in
     "logged_in_indicator": "#nav-link-accountList, a[href*='/your-account']",
+    # Delivery-location ("Deliver to") picker — Fresh availability is keyed on this
+    "location_trigger": "#nav-global-location-popover-link, #glow-ingress-block",
+    "pincode_input": "#GLUXZipUpdateInput, input[name='GLUXZip'], input[autocomplete='postal-code']",
+    "pincode_apply": "#GLUXZipUpdate input[type='submit'], #GLUXZipUpdate-announce, span#GLUXZipUpdate input",
+    "pincode_done": "button[name='glowDoneButton'], #GLUXConfirmClose, .a-popover-footer .a-button-input",
+    "location_header": "#glow-ingress-line2",
+    "address_list": "#GLUXAddressList, #glow-toaster-content",
     # Orders page
     "order_card": "div.order-card, div.js-order-card, [class*='order-card']",
     "order_filter_dropdown": "select#orderFilter, select[name='orderFilter']",
@@ -73,6 +80,15 @@ AMAZON_SIGNIN = (
 )
 AMAZON_ORDERS = "https://www.amazon.in/your-orders/orders?_encoding=UTF8&orderFilter=months-6"
 
+# Amazon Fresh availability/price is per-delivery-location. With no location set
+# for the session, Fresh product pages render "currently unavailable" and no
+# price. After login we set a deliverable location so every product page reports
+# real data: first try to pick the saved address starting with
+# DEFAULT_ADDRESS_PREFIX, and only fall back to entering DEFAULT_PINCODE if that
+# address can't be found. Override via DELIVERY_ADDRESS_PREFIX / DELIVERY_PINCODE.
+DEFAULT_ADDRESS_PREFIX = "82, Flat No 6"
+DEFAULT_PINCODE = "560094"
+
 ORDERS_REPORT_FILE = Path("orders_report.json")
 
 # Marker substrings that identify an Amazon Fresh order on the order list/details.
@@ -98,6 +114,27 @@ def default_orders_to_scrape() -> int:
     except ValueError:
         print(f"[config] ORDERS_TO_SCRAPE={raw!r} is not a valid integer; using 10.")
         return 10
+
+
+def delivery_pincode() -> str:
+    """Delivery pincode used to set Amazon's location so Fresh items report
+    correct availability/price. Reads DELIVERY_PINCODE from the environment
+    and falls back to DEFAULT_PINCODE when unset or not a 6-digit code."""
+    raw = (os.getenv("DELIVERY_PINCODE") or "").strip()
+    if re.fullmatch(r"\d{6}", raw):
+        return raw
+    if raw:
+        print(f"[config] DELIVERY_PINCODE={raw!r} is not a 6-digit code; using {DEFAULT_PINCODE}.")
+    return DEFAULT_PINCODE
+
+
+def delivery_address_prefix() -> str:
+    """Saved Amazon address to prefer when setting the delivery location.
+    Matched as a substring against each saved address in the "Deliver to"
+    popover. Reads DELIVERY_ADDRESS_PREFIX, falling back to
+    DEFAULT_ADDRESS_PREFIX."""
+    raw = (os.getenv("DELIVERY_ADDRESS_PREFIX") or "").strip()
+    return raw or DEFAULT_ADDRESS_PREFIX
 
 
 # ---------------------------------------------------------------------------
@@ -129,14 +166,6 @@ def parse_date(raw: str) -> str:
             y = f"20{y}" if len(y) == 2 else y
             return f"{y}-{int(mo):02d}-{int(d):02d}"
         return "unknown"
-
-
-_UNAVAILABLE_TERMS = (
-    "currently unavailable",
-    "out of stock",
-    "temporarily out of stock",
-    "no featured offers available",
-)
 
 
 def _unavailable_fields() -> dict:
@@ -445,6 +474,191 @@ async def login(page, amazon_username: str, amazon_password: str, headless: bool
 
 
 # ---------------------------------------------------------------------------
+# Delivery location
+# ---------------------------------------------------------------------------
+
+async def _read_location_header(page) -> str:
+    try:
+        return ((await page.locator(SELECTORS["location_header"]).first.inner_text(timeout=3_000)) or "").strip()
+    except Exception:
+        return ""
+
+
+async def _location_widget_open(page) -> bool:
+    """True if the "Deliver to" popover (saved-address list or pincode input)
+    is currently visible."""
+    for sel in (SELECTORS["pincode_input"], SELECTORS["address_list"]):
+        try:
+            if await page.locator(sel).first.is_visible():
+                return True
+        except Exception:
+            continue
+    return False
+
+
+async def _open_location_popover(page) -> bool:
+    """Open Amazon's "Deliver to" popover (idempotent — no-op if already open)."""
+    if await _location_widget_open(page):
+        return True
+    try:
+        trigger = page.locator(SELECTORS["location_trigger"]).first
+        await trigger.wait_for(state="visible", timeout=8_000)
+        await trigger.click()
+        await page.wait_for_timeout(1_000)
+    except Exception as exc:
+        print(f"[location] Could not open location popover ({exc}).")
+        return False
+    return await _location_widget_open(page)
+
+
+async def _select_saved_address(page, address_prefix: str) -> bool:
+    """Within the open location popover, pick the saved address whose visible
+    text contains `address_prefix`. Returns True only if a matching address
+    was found and clicked."""
+    print(f"[location] Looking for saved address containing {address_prefix!r}…")
+    candidates = (
+        page.locator(SELECTORS["address_list"]).get_by_text(address_prefix, exact=False),
+        page.get_by_text(address_prefix, exact=False),
+    )
+    target = None
+    for loc in candidates:
+        try:
+            if await loc.count() > 0:
+                target = loc.first
+                break
+        except Exception:
+            continue
+    if target is None:
+        print(f"[location] No saved address matching {address_prefix!r}.")
+        return False
+
+    try:
+        await target.scroll_into_view_if_needed(timeout=3_000)
+        await target.click(timeout=5_000)
+    except Exception as exc:
+        print(f"[location] Found address but click failed ({exc}).")
+        return False
+
+    # Selecting a saved address sometimes needs an explicit confirm.
+    for done in (
+        page.locator(SELECTORS["pincode_done"]).first,
+        page.get_by_role("button", name=re.compile(r"\b(done|apply|continue|use this address)\b", re.I)).first,
+    ):
+        try:
+            if await done.count() > 0 and await done.is_visible():
+                await done.click(timeout=3_000)
+                await page.wait_for_timeout(800)
+                break
+        except Exception:
+            continue
+
+    try:
+        await page.wait_for_load_state("networkidle", timeout=6_000)
+    except PlaywrightTimeoutError:
+        pass
+    print(f"[location] Selected saved address; header now {repr(await _read_location_header(page))}.")
+    return True
+
+
+async def _enter_pincode(page, pincode: str) -> bool:
+    """Fallback path: type `pincode` into the "Deliver to" popover and apply."""
+    print(f"[location] Setting delivery pincode to {pincode}…")
+    if not await _open_location_popover(page):
+        return False
+    try:
+        zip_input = page.locator(SELECTORS["pincode_input"]).first
+        await zip_input.wait_for(state="visible", timeout=8_000)
+        await zip_input.fill(pincode)
+    except PlaywrightTimeoutError:
+        print("[location] Pincode input did not appear; skipping.")
+        return False
+
+    apply_btn = page.locator(SELECTORS["pincode_apply"]).first
+    try:
+        if await apply_btn.count() > 0:
+            await apply_btn.click(timeout=4_000)
+        else:
+            await zip_input.press("Enter")
+    except Exception:
+        try:
+            await zip_input.press("Enter")
+        except Exception:
+            pass
+
+    try:
+        await page.wait_for_load_state("networkidle", timeout=6_000)
+    except PlaywrightTimeoutError:
+        pass
+    await page.wait_for_timeout(1_000)
+
+    # A confirmation step ("Done" / "Continue") sometimes follows the apply.
+    for done in (
+        page.locator(SELECTORS["pincode_done"]).first,
+        page.get_by_role("button", name=re.compile(r"\b(done|continue)\b", re.I)).first,
+    ):
+        try:
+            if await done.count() > 0 and await done.is_visible():
+                await done.click(timeout=3_000)
+                await page.wait_for_timeout(800)
+                break
+        except Exception:
+            continue
+
+    try:
+        await page.wait_for_load_state("networkidle", timeout=6_000)
+    except PlaywrightTimeoutError:
+        pass
+
+    header = await _read_location_header(page)
+    if pincode in header:
+        print(f"[location] Delivery location confirmed: {repr(header)}.")
+    else:
+        print(f"[location] Pincode submitted (header shows {repr(header)}).")
+    return True
+
+
+async def _set_delivery_location(page, address_prefix: str, pincode: str) -> bool:
+    """Set Amazon's "Deliver to" location so Fresh items report correct
+    availability/price (the Fresh catalog is keyed on the delivery location).
+
+    Prefers the saved address containing `address_prefix`; only falls back to
+    entering `pincode` if that address can't be found. The choice persists in a
+    session cookie, so every product page visited afterwards reports real data.
+
+    Best-effort: logs a warning and returns False if the widget can't be
+    driven, so the scrape still proceeds."""
+    if not await _open_location_popover(page):
+        print("[location] Location popover unavailable; continuing without setting it.")
+        return False
+    if await _select_saved_address(page, address_prefix):
+        return True
+    print(f"[location] Falling back to pincode {pincode}.")
+    return await _enter_pincode(page, pincode)
+
+
+async def _goto_with_retry(page, url: str, attempts: int = 3) -> None:
+    """page.goto that retries on net::ERR_ABORTED.
+
+    Applying a delivery location makes Amazon reload the current page; a goto
+    fired immediately afterwards can be interrupted by that reload and raise
+    net::ERR_ABORTED. Retrying after a short settle resolves it."""
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            await page.goto(url, wait_until="domcontentloaded")
+            return
+        except Exception as exc:
+            last_exc = exc
+            if "ERR_ABORTED" in str(exc) or "interrupted" in str(exc).lower():
+                print(f"[nav] goto aborted (attempt {attempt}/{attempts}); retrying…")
+                await page.wait_for_timeout(1_500)
+                continue
+            raise
+    assert last_exc is not None
+    raise last_exc
+
+
+# ---------------------------------------------------------------------------
 # Order scraping
 # ---------------------------------------------------------------------------
 
@@ -609,7 +823,8 @@ async def _expand_view_all_items(page) -> bool:
 
 
 async def _extract_products_from_detail_page(page) -> list[dict]:
-    """Pull product-title + product-page URL pairs from the order's item list.
+    """Pull product-title + product-page URL + purchased-price triples from the
+    order's item list.
 
     Amazon Fresh (UFPO) order-details pages render the actual ordered items
     inside `#ufpo-od-item-list-section`, with one `div[id$='-item-grid-row']`
@@ -620,9 +835,20 @@ async def _extract_products_from_detail_page(page) -> list[dict]:
     items' navigates to the itemmod sub-page that unhides it; either way
     `textContent` reads through the visibility.
 
+    The `price` is the price paid in THIS order (used for last_purchased_price);
+    it is NOT the product's current price — that comes from the product page.
+
     Falls back to a generic anchor scan for classic non-Fresh orders."""
     raw = await page.evaluate(r"""
         () => {
+          const priceFromEl = (el) => {
+            if (!el) return null;
+            const off = el.querySelector("span.a-price > span.a-offscreen, .a-price .a-offscreen");
+            const text = (off ? off.textContent : el.textContent) || '';
+            const m = text.match(/₹\s*([\d,]+(?:\.\d+)?)/);
+            return m ? parseFloat(m[1].replace(/,/g, '')) : null;
+          };
+
           // ----- Amazon Fresh (UFPO) order item list -----
           const section = document.querySelector('#ufpo-od-item-list-section');
           if (section) {
@@ -638,7 +864,7 @@ async def _extract_products_from_detail_page(page) -> list[dict]:
               if (!titleLink) continue;
               const title = (titleLink.textContent || '').replace(/\s+/g, ' ').trim();
               if (!title || title.length < 4) continue;
-              out.push({ title, href: titleLink.href });
+              out.push({ title, href: titleLink.href, price: priceFromEl(row) });
             }
             if (out.length) return out;
           }
@@ -666,7 +892,8 @@ async def _extract_products_from_detail_page(page) -> list[dict]:
             ) continue;
             if (seen.has(title)) continue;
             seen.add(title);
-            out.push({ title, href: a.href });
+            const container = a.closest('.a-fixed-left-grid, .a-row, li') || a.parentElement;
+            out.push({ title, href: a.href, price: priceFromEl(container) });
           }
           return out;
         }
@@ -724,16 +951,12 @@ async def _extract_main_image(page) -> str | None:
         return None
 
 
-async def _extract_availability(page) -> str:
-    """Two-state: 'Unavailable' if any out-of-stock marker is visible, else 'Available'."""
-    try:
-        body = (await page.locator("body").inner_text() or "").lower()
-        for term in _UNAVAILABLE_TERMS:
-            if term in body:
-                return "Unavailable"
-        return "Available"
-    except Exception:
-        return "Unavailable"
+def _availability_from_price(price: float | None) -> str:
+    """Availability is determined solely by whether the product page shows a
+    price: a priced product page is in stock, a price-less one is not. (We
+    deliberately avoid scanning page text — out-of-stock phrases bleed in from
+    unrelated carousels / 'compare with similar items' / other-seller blocks.)"""
+    return "Available" if price is not None else "Unavailable"
 
 
 async def extract_product_details(page) -> dict:
@@ -744,11 +967,12 @@ async def extract_product_details(page) -> dict:
         pass
     await page.wait_for_timeout(500)
 
+    price = await _extract_current_price(page)
     return {
-        "current_price": await _extract_current_price(page),
+        "current_price": price,
         "product_url": page.url,
         "image_url": await _extract_main_image(page),
-        "availability": await _extract_availability(page),
+        "availability": _availability_from_price(price),
     }
 
 
@@ -828,9 +1052,25 @@ async def run(num_orders: int, headless: bool) -> None:
         # ---- Login ----
         await login(page, amazon_username, amazon_password, headless)
 
+        # ---- Set delivery location so Fresh items report correct availability ----
+        print("[nav] Navigating home to set delivery location…")
+        await _goto_with_retry(page, AMAZON_HOME)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10_000)
+        except PlaywrightTimeoutError:
+            pass
+        await _set_delivery_location(page, delivery_address_prefix(), delivery_pincode())
+        # Applying a location reloads the page; let it settle before navigating
+        # away, otherwise the next goto can be interrupted (net::ERR_ABORTED).
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10_000)
+        except PlaywrightTimeoutError:
+            pass
+        await page.wait_for_timeout(1_000)
+
         # ---- Navigate to orders ----
         print("[nav] Navigating to orders page…")
-        await page.goto(AMAZON_ORDERS, wait_until="domcontentloaded")
+        await _goto_with_retry(page, AMAZON_ORDERS)
         try:
             await page.wait_for_load_state("networkidle", timeout=10_000)
         except PlaywrightTimeoutError:
@@ -889,6 +1129,7 @@ async def run(num_orders: int, headless: bool) -> None:
                         "date": order_date,
                         "category": "Grocery",
                         "product_url_from_order": it.get("href"),
+                        "purchased_price": it.get("price"),
                     })
                 print(f"[order {idx}/{actual_count}] {len(seen_titles)} product(s)")
             except Exception as exc:
@@ -902,13 +1143,19 @@ async def run(num_orders: int, headless: bool) -> None:
             t = p["title"]
             cur = unique_by_title.get(t)
             if cur is None:
-                unique_by_title[t] = dict(p)
+                entry = dict(p)
+                entry["last_purchased_price"] = p.get("purchased_price")
+                unique_by_title[t] = entry
                 continue
-            # Newer date wins.
+            # Newer date wins — and the last purchased price tracks that order.
             if p.get("date") and p["date"] != "unknown" and (
                 not cur.get("date") or cur["date"] == "unknown" or p["date"] > cur["date"]
             ):
                 cur["date"] = p["date"]
+                cur["last_purchased_price"] = p.get("purchased_price")
+            # Backfill a missing price even when the date isn't newer.
+            elif cur.get("last_purchased_price") is None and p.get("purchased_price") is not None:
+                cur["last_purchased_price"] = p.get("purchased_price")
             if not cur.get("product_url_from_order") and p.get("product_url_from_order"):
                 cur["product_url_from_order"] = p["product_url_from_order"]
 
@@ -946,6 +1193,7 @@ async def run(num_orders: int, headless: bool) -> None:
                 "last_ordered_date": None if not date or date == "unknown" else date,
                 "number_of_times_purchased": title_counts[title],
                 "current_price": details["current_price"],
+                "last_purchased_price": entry.get("last_purchased_price"),
                 "product_url": details["product_url"],
                 "image_url": details["image_url"],
                 "category": entry.get("category", "Grocery"),
@@ -979,15 +1227,16 @@ async def run(num_orders: int, headless: bool) -> None:
 
     print(
         f"\n{'#':<4}  {'Product Title':<50}  {'Date':<12}  {'Cnt':<4}  "
-        f"{'Price':<8}  {'Cat':<12}  {'Avail'}"
+        f"{'Price':<8}  {'LastPaid':<9}  {'Cat':<12}  {'Avail'}"
     )
-    print("-" * 110)
+    print("-" * 120)
     for i, p in enumerate(report_products, 1):
         title = p["title"][:48] + ".." if len(p["title"]) > 50 else p["title"]
         price = "" if p["current_price"] is None else f"₹{p['current_price']}"
+        last_paid = "" if p.get("last_purchased_price") is None else f"₹{p['last_purchased_price']}"
         print(
             f"{i:<4}  {title:<50}  {str(p['last_ordered_date']):<12}  "
-            f"{p['number_of_times_purchased']:<4}  {price:<8}  "
+            f"{p['number_of_times_purchased']:<4}  {price:<8}  {last_paid:<9}  "
             f"{str(p['category']):<12}  {p['availability']}"
         )
 

@@ -17,9 +17,14 @@ report containing:
 After each successful scrape, the report is also pushed to **Salesforce**: each
 unique product title is matched against `Grocery_Product__c.title__c`, and
 matching records get `number_of_times_purchased__c`, `last_ordered_date__c`,
-`current_price__c`, `product_url__c`, `image_url__c`, `availability__c`,
-`source__c` (= `"Amazon"`), and `scraped_at__c` updated. **No new records are
-ever created** — non-matching titles are skipped.
+`current_price__c`, `last_purchased_price__c`, `product_url__c`, `image_url__c`,
+`availability__c`, `source__c` (= `"Amazon"`), and `scraped_at__c` updated.
+**No new records are ever created** — non-matching titles are skipped.
+
+Note the price distinction: `current_price__c` is the live price read from the
+product page (and also the sole determinant of `availability__c` — priced
+means Available), while `last_purchased_price__c` is the price actually paid in
+the most recent order containing that product (read from the order item list).
 
 This is the Amazon sibling of the `purchase-history` project (Flipkart). Both
 projects write to the same Salesforce object; the `source__c` field
@@ -84,6 +89,8 @@ designed for local development and cloud deployment on **Render** (Docker-based)
 | `HEADLESS` | `false` locally, `true` in Docker |
 | `PORT` | `10000` (Render sets this automatically) |
 | `ORDERS_TO_SCRAPE` | `10` — fallback for both `scrape_amazon_orders.py` (when `--orders` is omitted) and `POST /api/products` (when the request body omits `"orders"`). Explicit values still override. |
+| `DELIVERY_ADDRESS_PREFIX` | `82, Flat No 6` — after login the scraper first tries to pick the saved "Deliver to" address whose text contains this substring; only if no match is found does it fall back to `DELIVERY_PINCODE`. |
+| `DELIVERY_PINCODE` | `560094` — 6-digit pincode entered as Amazon's "Deliver to" location when no saved address matches `DELIVERY_ADDRESS_PREFIX`. Fresh availability/price is per-location; with none set, items show "currently unavailable". |
 
 ## Environment Setup (Local)
 
@@ -137,17 +144,24 @@ python scrape_amazon_orders.py --headed=false   # headless
      Salesforce every 5 s for up to 3 minutes — works in both headed and
      headless mode. Paste the OTP into that field and save; the scraper picks
      it up, submits it, and immediately nulls the field.
-3. **Navigate** to `https://www.amazon.in/your-orders/orders?orderFilter=months-6`.
-4. **Filter for Amazon Fresh orders** — first try the dropdown if it exposes a
+3. **Set the delivery location** (so Fresh items report correct availability/
+   price): open the "Deliver to" popover and first try to pick the saved
+   address containing `DELIVERY_ADDRESS_PREFIX`; only if that's not found,
+   enter `DELIVERY_PINCODE`. The choice persists in a session cookie.
+4. **Navigate** to `https://www.amazon.in/your-orders/orders?orderFilter=months-6`.
+5. **Filter for Amazon Fresh orders** — first try the dropdown if it exposes a
    Fresh option; otherwise filter client-side by matching the order card text
    for `"Amazon Fresh"`, `"Sold by: Amazon Fresh"`, or `"Fulfilled by Amazon Fresh"`.
-5. **Paginate** until `num_orders` Fresh orders are collected (max 5 pages).
-6. **For each Fresh order**: visit its `/gp/your-account/order-details` page,
-   extract every product row's title + product-page URL, and the order date.
-7. **For each unique product**: visit its product page once to capture
-   `current_price`, `product_url`, `image_url`, and `availability`, then
+6. **Paginate** until `num_orders` Fresh orders are collected (max 5 pages).
+7. **For each Fresh order**: visit its `/gp/your-account/order-details` page,
+   extract every product row's title, product-page URL, the order date, and the
+   per-item **purchased price** (price paid in that order).
+8. **For each unique product**: visit its product page once to capture
+   `current_price`, `product_url`, `image_url`, and `availability`
+   (`availability` is derived solely from whether the product page shows a
+   price), carry the most-recent order's `last_purchased_price`, then
    immediately PATCH the matching `Grocery_Product__c` record in Salesforce.
-8. **Write** `orders_report.json` and print the summary table.
+9. **Write** `orders_report.json` and print the summary table.
 
 ## Selector Strategy
 
@@ -182,6 +196,7 @@ When a selector fails:
       "last_ordered_date": "2026-05-12",
       "number_of_times_purchased": 2,
       "current_price": 89.0,
+      "last_purchased_price": 85.0,
       "product_url": "https://www.amazon.in/dp/B0...",
       "image_url": "https://m.media-amazon.com/images/I/...",
       "category": "Grocery",
@@ -252,8 +267,12 @@ new env vars — the bridge reuses `SF_TOKEN_URL`, `SF_CLIENT_ID`,
 - Field mapping (hard-coded constants at the top of `salesforce_sync.py`):
   - Match field: `title__c`
   - Updated fields: `number_of_times_purchased__c`, `last_ordered_date__c`,
-    `current_price__c`, `product_url__c`, `image_url__c`, `category__c`,
-    `availability__c`, `source__c` (= `"Amazon"`), `scraped_at__c`
+    `current_price__c`, `last_purchased_price__c`, `product_url__c`,
+    `image_url__c`, `category__c`, `availability__c`, `source__c` (= `"Amazon"`),
+    `scraped_at__c`
+  - `current_price__c` = live product-page price; `last_purchased_price__c` =
+    price paid in the most recent order for that product (from the order item
+    list, NOT the product page).
 - The Connected App must grant access to the `Grocery_Product__c` sObject and
   the `api` scope. `Name` is auto-number on this object and **must not** be
   sent in POST/PATCH bodies.

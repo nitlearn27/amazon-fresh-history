@@ -45,6 +45,7 @@ TITLE_FIELD = "title__c"
 COUNT_FIELD = "number_of_times_purchased__c"
 DATE_FIELD = "last_ordered_date__c"
 PRICE_FIELD = "current_price__c"
+LAST_PURCHASED_PRICE_FIELD = "last_purchased_price__c"
 URL_FIELD = "product_url__c"
 IMAGE_FIELD = "image_url__c"
 CATEGORY_FIELD = "category__c"
@@ -167,6 +168,7 @@ def _build_payload(entry: dict) -> dict:
     put(COUNT_FIELD, entry.get("number_of_times_purchased"))
     put(DATE_FIELD, entry.get("last_ordered_date"))
     put(PRICE_FIELD, entry.get("current_price"))
+    put(LAST_PURCHASED_PRICE_FIELD, entry.get("last_purchased_price"))
     put(URL_FIELD, entry.get("product_url"))
     put(IMAGE_FIELD, entry.get("image_url"))
     put(CATEGORY_FIELD, entry.get("category"))
@@ -215,7 +217,7 @@ def _dedupe(products: Iterable[dict]) -> list[dict]:
         )
         # Prefer non-empty values for the per-product page fields.
         for k in (
-            "current_price", "product_url", "image_url",
+            "current_price", "last_purchased_price", "product_url", "image_url",
             "category", "availability", "source", "scraped_at",
         ):
             if not cur.get(k) and merged.get(k):
@@ -258,6 +260,7 @@ def sync_products(products: Iterable[dict]) -> dict:
                 f"count={entry.get('number_of_times_purchased')}  "
                 f"date={entry.get('last_ordered_date')}  "
                 f"price={entry.get('current_price')}  "
+                f"last_paid={entry.get('last_purchased_price')}  "
                 f"avail={entry.get('availability')}"
             )
         except SalesforceError as exc:

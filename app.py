@@ -8,8 +8,8 @@ Endpoints:
   GET  /openapi.json   → OpenAPI 3.0 spec
   GET  /api/products   → latest scrape output (full per-product field set:
                          product_name, date, number_of_times_purchased,
-                         current_price, product_url, image_url, category,
-                         availability, source, scraped_at)
+                         current_price, last_purchased_price, product_url,
+                         image_url, category, availability, source, scraped_at)
   POST /api/products   → start a scrape in a background thread (body: {"orders": <int>})
 """
 
@@ -96,6 +96,7 @@ def _shape_products() -> list[dict]:
             "date": date,
             "number_of_times_purchased": count,
             "current_price": p.get("current_price"),
+            "last_purchased_price": p.get("last_purchased_price"),
             "product_url": p.get("product_url"),
             "image_url": p.get("image_url"),
             "category": p.get("category"),
@@ -197,10 +198,12 @@ _OPENAPI_SPEC = {
         "description": (
             "Amazon Fresh order scraper + Salesforce `Grocery_Product__c` sync.\n\n"
             "After every successful scrape, the scraper drills into each unique product's "
-            "Amazon page to capture current price, image, URL and availability, then "
-            "**updates** matching `Grocery_Product__c` records using `title__c` as the "
-            "match field — existing records are updated; non-matching titles are skipped "
-            "(no new records are ever created). Each row is stamped with `source__c=\"Amazon\"`.\n\n"
+            "Amazon page to capture current price, image, URL and availability (a product "
+            "page that shows a price counts as available), and carries the last purchased "
+            "price from the order history, then **updates** matching `Grocery_Product__c` "
+            "records using `title__c` as the match field — existing records are updated; "
+            "non-matching titles are skipped (no new records are ever created). Each row is "
+            "stamped with `source__c=\"Amazon\"`.\n\n"
             "A scrape runs in a background thread and typically takes 3–8 minutes. "
             "Poll `GET /api/products` until the status flips from `running` to `ok`."
         ),
@@ -362,7 +365,10 @@ _OPENAPI_SPEC = {
                     "product_name":              {"type": "string"},
                     "date":                      {"type": "string", "nullable": True, "example": "2026-04-12"},
                     "number_of_times_purchased": {"type": "integer"},
-                    "current_price":             {"type": "number", "nullable": True, "example": 199.0},
+                    "current_price":             {"type": "number", "nullable": True, "example": 199.0,
+                                                  "description": "Live price from the product page; also determines availability."},
+                    "last_purchased_price":      {"type": "number", "nullable": True, "example": 185.0,
+                                                  "description": "Price paid in the most recent order containing this product."},
                     "product_url":               {"type": "string", "nullable": True, "example": "https://www.amazon.in/dp/B0..."},
                     "image_url":                 {"type": "string", "nullable": True, "example": "https://m.media-amazon.com/images/..."},
                     "category":                  {"type": "string", "nullable": True, "example": "Grocery"},
