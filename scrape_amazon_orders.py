@@ -41,6 +41,12 @@ SELECTORS = {
         "input#auth-signin-button, input[aria-labelledby*='auth-signin-button'], "
         "input#cvf-submit-otp-button"
     ),
+    # 2-step verification "delivery chooser" page (/ap/mfa/new-otp): a "Send OTP"
+    # / "Continue" button that must be clicked before the code-entry field renders.
+    "otp_send_button": (
+        "input#auth-send-code, input#cvf-submit-otp-button, "
+        "input[aria-labelledby*='cvf-submit-otp-button'], input#auth-get-new-otp"
+    ),
     # Logged-in marker on amazon.in
     "logged_in_indicator": "#nav-link-accountList, a[href*='/your-account']",
     # Delivery-location ("Deliver to") picker — Fresh availability is keyed on this
@@ -305,13 +311,88 @@ async def _poll_salesforce_for_otp(
     return None
 
 
+async def _on_two_step_verification_page(page) -> bool:
+    """Detect Amazon's 2-step verification flow by URL/title *before* the OTP
+    input renders.
+
+    This matters because Amazon often inserts an intermediate "delivery
+    chooser" page (URL `/ap/mfa/new-otp`, title "Two-Step Verification") that
+    has a "Send OTP" button but no code-entry field yet — most common on
+    datacenter IPs (Render/Railway) where Amazon trusts the device less. The
+    code-entry field only appears on the following `/ap/mfa` page."""
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        url = ""
+    if "/ap/mfa" in url or "/ap/cvf" in url:
+        return True
+    try:
+        title = ((await page.title()) or "").lower()
+    except Exception:
+        title = ""
+    return "two-step verification" in title or "two step verification" in title
+
+
+async def _advance_otp_delivery_chooser(page) -> None:
+    """On the `/ap/mfa/new-otp` chooser page Amazon shows OTP delivery options
+    and a "Send OTP" / "Continue" button. If the code-entry field isn't already
+    visible, click that button to reach the screen where the OTP is typed."""
+    otp_input = page.locator(SELECTORS["otp_input"]).first
+    try:
+        if await otp_input.is_visible():
+            return  # already on the code-entry screen — nothing to advance
+    except Exception:
+        pass
+
+    clicked = False
+    send_btn = page.locator(SELECTORS["otp_send_button"]).first
+    try:
+        if await send_btn.count() > 0 and await send_btn.is_visible():
+            await send_btn.click(timeout=5_000)
+            clicked = True
+    except Exception:
+        pass
+    if not clicked:
+        send_pattern = re.compile(r"send\s*otp|send\s*code|get\s*otp|continue", re.I)
+        for loc in (
+            page.get_by_role("button", name=send_pattern),
+            page.get_by_role("link", name=send_pattern),
+            page.locator("input[type='submit']"),
+        ):
+            try:
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    await loc.first.click(timeout=5_000)
+                    clicked = True
+                    break
+            except Exception:
+                continue
+
+    if not clicked:
+        return
+    print("[auth] Clicked 'Send OTP' on the 2-step verification chooser page.")
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10_000)
+    except PlaywrightTimeoutError:
+        pass
+    await page.wait_for_timeout(1_000)
+    await _log_page_state(page, "after Send OTP")
+
+
 async def _handle_otp_challenge(page) -> bool:
     """If Amazon asks for an OTP (2-step verification), poll Salesforce
     Purchase_Info__c.my_amazon_otp__c regardless of headed/headless mode.
     Returns True iff we entered an OTP."""
+    # Amazon may land us on the OTP *delivery chooser* (/ap/mfa/new-otp) before
+    # the code-entry field exists. Detect the 2-step flow by URL/title and click
+    # "Send OTP" so the code field renders, instead of giving up immediately.
+    if await _on_two_step_verification_page(page):
+        print("[auth] Two-step verification flow detected — advancing to code entry.")
+        await _log_page_state(page, "2SV chooser")
+        await _advance_otp_delivery_chooser(page)
+
     otp_input = page.locator(SELECTORS["otp_input"]).first
     try:
-        await otp_input.wait_for(state="visible", timeout=4_000)
+        await otp_input.wait_for(state="visible", timeout=8_000)
         print("[auth] OTP input detected — Amazon is asking for 2-step verification.")
         await _log_page_state(page, "OTP screen")
     except PlaywrightTimeoutError:
@@ -360,6 +441,44 @@ async def _handle_otp_challenge(page) -> bool:
         print(f"[auth] Warning: failed to clear OTP in Salesforce: {exc}")
 
     return True
+
+
+async def _dismiss_post_login_interstitial(page) -> None:
+    """After a successful sign-in on an untrusted IP, Amazon often shows an
+    interstitial pop-up before the account is usable — e.g. "Add a mobile
+    number", "Set up a passkey", or "Keep your account secure". These are
+    optional and offer a "Not now" / "Skip" / "Maybe later" dismissal. Click
+    any such control so the flow can proceed; no-op if none is present."""
+    try:
+        url = (page.url or "").lower()
+    except Exception:
+        url = ""
+    # Only relevant while still parked on an /ap/ interstitial, not the storefront.
+    if "/ap/" not in url and "/cvf/" not in url:
+        return
+
+    skip_pattern = re.compile(
+        r"\b(not now|skip(?:\s+for\s+now)?|maybe later|remind me later|"
+        r"no thanks|do this later|continue shopping)\b",
+        re.I,
+    )
+    for loc in (
+        page.get_by_role("button", name=skip_pattern),
+        page.get_by_role("link", name=skip_pattern),
+        page.locator("a#ap-account-fixup-phone-skip-link, input#ap-account-fixup-phone-skip-link"),
+    ):
+        try:
+            if await loc.count() > 0 and await loc.first.is_visible():
+                await loc.first.click(timeout=4_000)
+                print("[auth] Dismissed a post-login interstitial pop-up.")
+                try:
+                    await page.wait_for_load_state("networkidle", timeout=8_000)
+                except PlaywrightTimeoutError:
+                    pass
+                await page.wait_for_timeout(800)
+                return
+        except Exception:
+            continue
 
 
 async def login(page, amazon_username: str, amazon_password: str, headless: bool) -> None:
@@ -451,6 +570,10 @@ async def login(page, amazon_username: str, amazon_password: str, headless: bool
 
     # Step 4: post-login captcha (rare but possible)
     await _handle_captcha_block(page)
+
+    # Step 5: dismiss any optional interstitial ("Add mobile number" / passkey /
+    # "Keep your account secure") so it doesn't block the logged-in check.
+    await _dismiss_post_login_interstitial(page)
 
     try:
         await page.wait_for_load_state("networkidle", timeout=15_000)
