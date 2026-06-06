@@ -1,0 +1,93 @@
+[auth] Logging in to Amazon as …***.com
+[auth] headless=False
+[auth] Navigating to signin page…
+[trace] on signin page: url='https://www.amazon.in/ax/claim?arb=c1ae116a-da4e-4bf4-9e5b-e3defd71adac'
+[trace] on signin page: title='Amazon Sign-In'
+[trace] on signin page: heading='Sign in or create account'
+[auth] Email/phone entered.
+[auth] Clicked Continue.
+[trace] after Continue: url='https://www.amazon.in/ax/claim?openid.return_to=https%3A%2F%2Fwww.amazon.in%2Fyour-orders%2Forders&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0&arb=814e1ace-3cc1-4ae5-84c3-8f09c72128e5&openid.assoc_handle=inflex&openid.mode=checkid_setup&policy_handle=Retail-Checkout'
+[trace] after Continue: title='Amazon Sign In'
+[trace] after Continue: heading='Sign in'
+[auth] Password entered.
+[auth] Clicked Sign-In.
+[trace] after Sign-In: url='https://www.amazon.in/ap/mfa?ie=UTF8&arb=156489c4-75b7-473f-813f-9f6a8f2d1871&mfa.arb.value=156489c4-75b7-473f-813f-9f6a8f2d1871&mfa.arb.key=arb'
+[trace] after Sign-In: title='Two-Step Verification'
+[trace] after Sign-In: heading='Two-Step Verification'
+[auth] Checking for OTP / 2-step verification screen…
+[auth] Two-step verification flow detected — advancing to code entry.
+[trace] 2SV chooser: url='https://www.amazon.in/ap/mfa?ie=UTF8&arb=156489c4-75b7-473f-813f-9f6a8f2d1871&mfa.arb.value=156489c4-75b7-473f-813f-9f6a8f2d1871&mfa.arb.key=arb'
+[trace] 2SV chooser: title='Two-Step Verification'
+[trace] 2SV chooser: heading='Two-Step Verification'
+[auth] OTP input detected — Amazon is asking for 2-step verification.
+[trace] OTP screen: url='https://www.amazon.in/ap/mfa?ie=UTF8&arb=156489c4-75b7-473f-813f-9f6a8f2d1871&mfa.arb.value=156489c4-75b7-473f-813f-9f6a8f2d1871&mfa.arb.key=arb'
+[trace] OTP screen: title='Two-Step Verification'
+[trace] OTP screen: heading='Two-Step Verification'
+[auth] Amazon prompted for OTP. Polling Salesforce Purchase_Info__c.my_amazon_otp__c every 5s (max 180s)…
+[auth] ACTION REQUIRED: open Salesforce → Purchase_Info__c → set my_amazon_otp__c to the OTP that Amazon just emailed/SMS'd, then save.
+[salesforce] Obtained access token via client_credentials grant.
+[salesforce] OTP query → HTTP 200, records=0
+[auth] Salesforce OTP poll 1/36 (t=0s) → empty; sleeping 5s…
+[salesforce] OTP query → HTTP 200, records=0
+[auth] Salesforce OTP poll 2/36 (t=5s) → empty; sleeping 5s…
+[salesforce] OTP query → HTTP 200, records=0
+[auth] Salesforce OTP poll 3/36 (t=10s) → empty; sleeping 5s…
+[salesforce] OTP query → HTTP 200, records=0
+[auth] Salesforce OTP poll 4/36 (t=15s) → empty; sleeping 5s…
+[salesforce] OTP query → HTTP 200, records=1
+[salesforce] OTP found on record a08dM00000hDWKgQAO (length=6).
+[auth] OTP received from Salesforce on attempt 5/36 (t=20s).
+[auth] OTP filled into Amazon (6 digits). Submitting…
+[auth] Clicked OTP submit button.
+[trace] after OTP submit: url='https://www.amazon.in/your-orders/orders'
+[trace] after OTP submit: title='Your Orders'
+[trace] after OTP submit: heading='Skip to'
+[salesforce] Clearing my_amazon_otp__c on record a08dM00000hDWKgQAO…
+[salesforce] Clear OTP → HTTP 204.
+[auth] Cleared OTP from Salesforce.
+[trace] post-login final state: url='https://www.amazon.in/your-orders/orders'
+[trace] post-login final state: title='Your Orders'
+[trace] post-login final state: heading='Skip to'
+[auth] is_logged_in=True — account nav element present at https://www.amazon.in/your-orders/orders
+[auth] Amazon login successful.
+[nav] Navigating home to set delivery location…
+[location] Looking for saved address containing '82, Flat No 6'…
+[location] Found address but click failed (Locator.click: Timeout 5000ms exceeded.
+Call log:
+  - waiting for locator("#GLUXAddressList, #glow-toaster-content").get_by_text("82, Flat No 6").first
+    - locator resolved to <span class="a-text-normal"> 82, Flat No 6, 3rd Floor, Rohini Enclave 16th Cr…</span>
+  - attempting click action
+    2 × waiting for element to be visible, enabled and stable
+      - element is visible, enabled and stable
+      - scrolling into view if needed
+      - done scrolling
+      - <input type="submit" aria-pressed="false" class="a-button-input" deliverydestinationtype="CUSTOMER_ADDRESS" name="AIOJO4O35WQCZHSHX3NIG12JMQ6MRM9ONA3INO9MRM6QMJ1PXTQ2EYA2OXRE2WC7:0:oosnssjrmllq" aria-label="ARTI KUMARI 82, Flat No 6, 3rd Floor, Rohini Enclave 16th Cross Sanjay Nagar, BENGALURU KARNATAKA 560094"/> intercepts pointer events
+    - retrying click action
+    - waiting 20ms
+    2 × waiting for element to be visible, enabled and stable
+      - element is visible, enabled and stable
+      - scrolling into view if needed
+      - done scrolling
+      - <input type="submit" aria-pressed="false" class="a-button-input" deliverydestinationtype="CUSTOMER_ADDRESS" name="AIOJO4O35WQCZHSHX3NIG12JMQ6MRM9ONA3INO9MRM6QMJ1PXTQ2EYA2OXRE2WC7:0:oosnssjrmllq" aria-label="ARTI KUMARI 82, Flat No 6, 3rd Floor, Rohini Enclave 16th Cross Sanjay Nagar, BENGALURU KARNATAKA 560094"/> intercepts pointer events
+    - retrying click action
+      - waiting 100ms
+    9 × waiting for element to be visible, enabled and stable
+      - element is visible, enabled and stable
+      - scrolling into view if needed
+      - done scrolling
+      - <input type="submit" aria-pressed="false" class="a-button-input" deliverydestinationtype="CUSTOMER_ADDRESS" name="AIOJO4O35WQCZHSHX3NIG12JMQ6MRM9ONA3INO9MRM6QMJ1PXTQ2EYA2OXRE2WC7:0:oosnssjrmllq" aria-label="ARTI KUMARI 82, Flat No 6, 3rd Floor, Rohini Enclave 16th Cross Sanjay Nagar, BENGALURU KARNATAKA 560094"/> intercepts pointer events
+    - retrying click action
+      - waiting 500ms
+).
+[location] Falling back to pincode 560094.
+[location] Setting delivery pincode to 560094…
+[location] Delivery location confirmed: 'Bengaluru 560094\u200c'.
+
+[cart] Searching Fresh for 'Aashirvaad Atta with Multigrains, 5kg pack, The High Fibre Atta'…
+[cart] No confident match for 'Aashirvaad Atta with Multigrains, 5kg pack, The High Fibre Atta' (best='Aashirvaad' @ 0.28).
+
+[cart] Done: 0 added, 1 not matched, cart now holds 8 item(s).
+
+#     Requested                                 Matched                                   Score   Added
+----------------------------------------------------------------------------------------------------
+1     Aashirvaad Atta with Multigrains, 5kg     Aashirvaad                                0.282   no

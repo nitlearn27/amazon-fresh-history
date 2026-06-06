@@ -8,5 +8,7 @@ __pycache__/
 orders_report.json
 *.pyc
 *.png
+*.log
+.vscode/
 .claude/
 .DS_Store

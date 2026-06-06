@@ -24,9 +24,12 @@ Salesforce `Grocery_Product__c` records.
 | `GET`  | `/openapi.json`  | OpenAPI 3.0 spec.                                                           |
 | `GET`  | `/api/products`  | Latest scrape output.                                                       |
 | `POST` | `/api/products`  | Start a scrape in a background thread. Body: `{"orders": <int>}` (default 10). |
+| `GET`  | `/api/cart`      | Result of the last add-to-cart run (`added` vs `not_found`).               |
+| `POST` | `/api/cart`      | Add Amazon Fresh products to the cart by name. Body: `{"products": ["name", …]}`. |
 
 A scrape typically takes 3–8 minutes. Poll `GET /api/products` until `status`
-flips from `running` to results.
+flips from `running` to results. A scrape and a cart run cannot overlap (they
+share the single Amazon account) — the second request gets `409`.
 
 ---
 
@@ -108,12 +111,37 @@ curl -X POST http://localhost:3001/api/products \
 curl http://localhost:3001/api/products
 ```
 
+### Add Amazon Fresh products to the cart
+
+```bash
+# Via the API — names are searched, fuzzy-matched, and added one unit each
+curl -X POST http://localhost:3001/api/cart \
+  -H "Content-Type: application/json" \
+  -d '{"products": ["Amul Gold Full Cream Milk 500ml", "Vedaka Toor Dal 1kg"]}'
+
+# Poll for the result (added vs not_found)
+curl http://localhost:3001/api/cart
+```
+
+Each name is searched on Amazon Fresh and matched against result titles with a
+`difflib` similarity ratio; the best result is added only if it clears the
+confidence threshold. Names that don't match confidently are reported under
+`not_found`. The run **never proceeds to checkout** — matched items are left in
+the cart for you to review and buy manually.
+
 ### Run the scraper directly (no Flask)
 
 ```bash
 python scrape_amazon_orders.py                  # headed, 10 orders
 python scrape_amazon_orders.py --orders=5
 python scrape_amazon_orders.py --headed=false   # headless
+```
+
+### Add to cart directly (no Flask)
+
+```bash
+python amazon_cart.py "Amul Gold Full Cream Milk 500ml" "Vedaka Toor Dal 1kg"
+python amazon_cart.py "Vedaka Toor Dal 1kg" --headed=false   # headless
 ```
 
 ### Re-sync the existing report to Salesforce (no re-scrape)
@@ -203,7 +231,8 @@ These map to `Grocery_Product__c` fields `current_price__c`,
 
 ## Notes & constraints
 
-- **Read-only.** No purchase, cancel, return, or any write action on Amazon.
+- **Cart is the only write.** Scraping is read-only; `POST /api/cart` adds items
+  to the cart but stops there — no purchase, checkout, cancel, or return.
 - **No credential logging.** The username is masked; the password never reaches
   stdout.
 - **No new Salesforce records.** Matches by `title__c` only; misses are logged

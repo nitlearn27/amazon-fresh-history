@@ -61,6 +61,7 @@ designed for local development and cloud deployment on **Render** (Docker-based)
 ├── requirements.txt
 ├── app.py                   # Flask web service (entry point) + Swagger UI at /docs
 ├── scrape_amazon_orders.py  # Core scraping logic; calls salesforce_sync at end
+├── amazon_cart.py           # Add Fresh products to cart by name (search + fuzzy match)
 └── salesforce_sync.py       # OAuth + PATCH Grocery_Product__c.title__c matches
 ```
 
@@ -121,6 +122,11 @@ PORT=3001 HEADLESS=false python app.py
 | `GET` | `/openapi.json` | OpenAPI 3.0 spec |
 | `GET` | `/api/products` | Latest scrape output, `{product_name, date, number_of_times_purchased, ...}` shape |
 | `POST` | `/api/products` | Start a scrape (runs in background thread). Body: `{"orders": <int>}`, default 10 |
+| `GET` | `/api/cart` | Result of the last add-to-cart run: `{requested, added[], not_found[], cart_count}` |
+| `POST` | `/api/cart` | Add Amazon Fresh products to the cart by name (background thread). Body: `{"products": [<str>, ...]}` |
+
+Scrapes and cart runs share the single Amazon account and cannot overlap — the
+second concurrent `POST` returns `409`.
 
 Open `http://localhost:3001/docs` for the interactive playground (the `/` route
 redirects there).
@@ -282,9 +288,33 @@ new env vars — the bridge reuses `SF_TOKEN_URL`, `SF_CLIENT_ID`,
   `Grocery_Product__c` records. For products sold on both retailers, the
   `source__c` field reflects whichever scraper ran last — this is by design.
 
+## Add-to-cart flow (`amazon_cart.py`)
+
+The one write action the service performs. `POST /api/cart` with
+`{"products": [<name>, ...]}` runs `add_products_to_cart()` in a background
+thread:
+
+1. **Reuse the session** — `open_logged_in_page()` (factored out of
+   `scrape_amazon_orders.run()`) does launch + login + OTP/captcha handling +
+   delivery-location setup, identical to a scrape. The Fresh add-to-cart button
+   is location-keyed, so this setup is required.
+2. **For each name** — search the Fresh node
+   (`/s?k=<name>&i=nowstore`), scan up to `MAX_RESULTS_TO_SCAN` result cards,
+   and pick the best title by `difflib.SequenceMatcher` ratio. Add one unit only
+   if the score clears `MATCH_THRESHOLD` (default `0.6`); confirm via the
+   `#nav-cart-count` badge incrementing.
+3. **Report** — return `{requested, added[], not_found[], cart_count, added_at}`.
+   Unmatched names land in `not_found` with their best candidate + score.
+
+Cart-specific selectors live in `CART_SELECTORS` at the top of `amazon_cart.py`
+(same convention as `SELECTORS` in the scraper). The flow **stops at the cart**
+— it never opens checkout. A scrape and a cart run cannot run concurrently
+(shared Amazon account → `409`).
+
 ## Out of Scope
 
-- No purchase, cancel, return, or any write action on the Amazon account.
+- No checkout, purchase, payment, cancel, or return. (Adding to cart via
+  `POST /api/cart` is in scope; everything past the cart is not.)
 - No scraping beyond Amazon Fresh orders (other Amazon orders are skipped).
 - No creation of new Salesforce records — sync only updates existing titles.
 - No captcha solving — captchas always require a one-time headed local run.

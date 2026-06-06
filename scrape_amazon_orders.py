@@ -1118,10 +1118,19 @@ async def visit_product_page(page, product_url: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Main
+# Shared session setup
 # ---------------------------------------------------------------------------
 
-async def run(num_orders: int, headless: bool) -> None:
+async def open_logged_in_page(pw, headless: bool):
+    """Launch Chromium, log in to Amazon, set the delivery location, and return
+    (browser, context, page) ready for either scraping or cart actions.
+
+    Centralises the launch/login/location boilerplate so every Amazon operation
+    (order scraping, add-to-cart) shares the same hardened login + Fresh
+    location handling. Callers own closing the returned context/browser.
+
+    Reads AMAZON_USERNAME / AMAZON_PASSWORD from the environment and exits if
+    either is missing."""
     load_dotenv()
     amazon_username = os.getenv("AMAZON_USERNAME", "")
     amazon_password = os.getenv("AMAZON_PASSWORD", "")
@@ -1130,66 +1139,76 @@ async def run(num_orders: int, headless: bool) -> None:
         print("[error] AMAZON_USERNAME and AMAZON_PASSWORD must both be set in .env")
         sys.exit(1)
 
+    # --no-sandbox / --disable-dev-shm-usage are required inside Docker (Render).
+    # The extra flags reduce Chromium's memory footprint in headless mode.
+    browser_args = []
+    if headless:
+        browser_args = [
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-extensions",
+            "--no-first-run",
+            "--disable-default-apps",
+            "--mute-audio",
+            "--hide-scrollbars",
+            "--disable-background-networking",
+            "--disable-sync",
+            "--disable-translate",
+            "--metrics-recording-only",
+            "--safebrowsing-disable-auto-update",
+        ]
+
+    browser = await pw.chromium.launch(
+        headless=headless,
+        slow_mo=900 if not headless else 0,
+        args=browser_args,
+    )
+
+    context = await browser.new_context(
+        viewport={"width": 1280, "height": 800},
+    )
+    page = await context.new_page()
+
+    # Abort image/media/font requests — not needed for data extraction and
+    # they are the biggest contributors to Chromium's memory usage.
+    async def _block_heavy(route):
+        if route.request.resource_type in {"image", "media", "font"}:
+            await route.abort()
+        else:
+            await route.continue_()
+
+    await page.route("**/*", _block_heavy)
+
+    # ---- Login ----
+    await login(page, amazon_username, amazon_password, headless)
+
+    # ---- Set delivery location so Fresh items report correct availability ----
+    print("[nav] Navigating home to set delivery location…")
+    await _goto_with_retry(page, AMAZON_HOME)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10_000)
+    except PlaywrightTimeoutError:
+        pass
+    await _set_delivery_location(page, delivery_address_prefix(), delivery_pincode())
+    # Applying a location reloads the page; let it settle before navigating
+    # away, otherwise the next goto can be interrupted (net::ERR_ABORTED).
+    try:
+        await page.wait_for_load_state("networkidle", timeout=10_000)
+    except PlaywrightTimeoutError:
+        pass
+    await page.wait_for_timeout(1_000)
+
+    return browser, context, page
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+async def run(num_orders: int, headless: bool) -> None:
     async with async_playwright() as pw:
-        # --no-sandbox / --disable-dev-shm-usage are required inside Docker (Render).
-        # The extra flags reduce Chromium's memory footprint in headless mode.
-        browser_args = []
-        if headless:
-            browser_args = [
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-extensions",
-                "--no-first-run",
-                "--disable-default-apps",
-                "--mute-audio",
-                "--hide-scrollbars",
-                "--disable-background-networking",
-                "--disable-sync",
-                "--disable-translate",
-                "--metrics-recording-only",
-                "--safebrowsing-disable-auto-update",
-            ]
-
-        browser = await pw.chromium.launch(
-            headless=headless,
-            slow_mo=900 if not headless else 0,
-            args=browser_args,
-        )
-
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 800},
-        )
-        page = await context.new_page()
-
-        # Abort image/media/font requests — not needed for data extraction and
-        # they are the biggest contributors to Chromium's memory usage.
-        async def _block_heavy(route):
-            if route.request.resource_type in {"image", "media", "font"}:
-                await route.abort()
-            else:
-                await route.continue_()
-
-        await page.route("**/*", _block_heavy)
-
-        # ---- Login ----
-        await login(page, amazon_username, amazon_password, headless)
-
-        # ---- Set delivery location so Fresh items report correct availability ----
-        print("[nav] Navigating home to set delivery location…")
-        await _goto_with_retry(page, AMAZON_HOME)
-        try:
-            await page.wait_for_load_state("networkidle", timeout=10_000)
-        except PlaywrightTimeoutError:
-            pass
-        await _set_delivery_location(page, delivery_address_prefix(), delivery_pincode())
-        # Applying a location reloads the page; let it settle before navigating
-        # away, otherwise the next goto can be interrupted (net::ERR_ABORTED).
-        try:
-            await page.wait_for_load_state("networkidle", timeout=10_000)
-        except PlaywrightTimeoutError:
-            pass
-        await page.wait_for_timeout(1_000)
+        browser, context, page = await open_logged_in_page(pw, headless)
 
         # ---- Navigate to orders ----
         print("[nav] Navigating to orders page…")

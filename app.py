@@ -49,10 +49,29 @@ _state = {
     "error": None,
 }
 
+# Add-to-cart state — same shape as _state. Kept separate from the scrape state
+# so each operation reports its own last result / error independently.
+_cart_state = {
+    "running": False,
+    "last_result": None,          # dict from add_products_to_cart()
+    "last_run_at": None,
+    "error": None,
+}
+
+
+def _account_busy() -> bool:
+    """True if a scrape or a cart run is in flight. Both launch their own
+    Chromium against the single Amazon account, so they must not overlap."""
+    return _state["running"] or _cart_state["running"]
+
+
+def _headless() -> bool:
+    return os.getenv("HEADLESS", "true").lower() in ("true", "1", "yes")
+
 
 def _run_scrape(num_orders: int) -> None:
     """Blocking function executed in a background thread."""
-    headless = os.getenv("HEADLESS", "true").lower() in ("true", "1", "yes")
+    headless = _headless()
     try:
         from scrape_amazon_orders import run
         asyncio.run(run(num_orders=num_orders, headless=headless))
@@ -70,6 +89,26 @@ def _run_scrape(num_orders: int) -> None:
     finally:
         _state["running"] = False
         _state["last_run_at"] = datetime.now(tz=timezone.utc).isoformat()
+
+
+def _run_cart(names: list) -> None:
+    """Blocking add-to-cart run executed in a background thread.
+
+    Catches BaseException (not just Exception) so that a login() sys.exit(1)
+    raised inside this thread surfaces as an error rather than dying silently."""
+    headless = _headless()
+    try:
+        from amazon_cart import add_products_to_cart
+        _cart_state["last_result"] = asyncio.run(
+            add_products_to_cart(names, headless=headless)
+        )
+        _cart_state["error"] = None
+    except BaseException as exc:
+        _cart_state["error"] = str(exc) or exc.__class__.__name__
+        print(f"[cart] Error: {exc}")
+    finally:
+        _cart_state["running"] = False
+        _cart_state["last_run_at"] = datetime.now(tz=timezone.utc).isoformat()
 
 
 # ---------------------------------------------------------------------------
@@ -163,10 +202,10 @@ def api_refresh_products():
     Poll GET /api/products until status switches from "running" to having data.
     """
     with _lock:
-        if _state["running"]:
+        if _account_busy():
             return jsonify({
                 "status": "running",
-                "message": "A scrape is already in progress.",
+                "message": "A scrape or cart run is already in progress.",
             }), 409
 
         body = request.get_json(silent=True) or {}
@@ -183,6 +222,87 @@ def api_refresh_products():
         "status": "started",
         "orders_requested": num_orders,
         "message": "Scrape started. Poll GET /api/products until results appear.",
+    }), 202
+
+
+@app.route("/api/cart", methods=["GET"])
+def api_get_cart():
+    """
+    Returns the result of the most recent add-to-cart run.
+
+    Response (200) when a run has completed:
+      { "requested": 3, "added": [...], "not_found": [...], "cart_count": 5, "added_at": "..." }
+
+    Response (202) if a cart run is currently in progress.
+    Response (404) if no cart run has been started yet.
+    Response (500) if the last cart run errored.
+    """
+    if _cart_state["running"]:
+        return jsonify({
+            "status": "running",
+            "message": "A cart run is in progress. Try again shortly.",
+        }), 202
+
+    if _cart_state["error"]:
+        return jsonify({
+            "status": "error",
+            "error": _cart_state["error"],
+            "last_run_at": _cart_state["last_run_at"],
+        }), 500
+
+    if _cart_state["last_result"] is None:
+        return jsonify({
+            "status": "no_data",
+            "message": "No cart run has been started yet. POST /api/cart to start one.",
+        }), 404
+
+    return jsonify(_cart_state["last_result"]), 200
+
+
+@app.route("/api/cart", methods=["POST"])
+def api_add_to_cart():
+    """
+    Add one unit of each named Amazon Fresh product to the cart.
+
+    JSON body: { "products": ["name1", "name2", ...] }
+
+    Each name is searched on Amazon Fresh, fuzzy-matched to the best result, and
+    added if the match clears the confidence threshold. Unmatched names are
+    reported in the result's `not_found` list. The run NEVER proceeds to
+    checkout — items are left in the cart for manual review.
+
+    Returns 202 immediately. Poll GET /api/cart for the result.
+    """
+    with _lock:
+        if _account_busy():
+            return jsonify({
+                "status": "running",
+                "message": "A scrape or cart run is already in progress.",
+            }), 409
+
+        body = request.get_json(silent=True) or {}
+        products = body.get("products")
+        if (
+            not isinstance(products, list)
+            or not products
+            or not all(isinstance(p, str) and p.strip() for p in products)
+        ):
+            return jsonify({
+                "status": "invalid_request",
+                "message": 'Body must be {"products": ["name1", "name2", ...]} with at least one non-empty name.',
+            }), 400
+
+        names = [p.strip() for p in products]
+        _cart_state["running"] = True
+        _cart_state["error"] = None
+
+    thread = threading.Thread(target=_run_cart, args=(names,), daemon=True)
+    thread.start()
+
+    return jsonify({
+        "status": "started",
+        "products_requested": len(names),
+        "message": "Add-to-cart started. Poll GET /api/cart until results appear.",
     }), 202
 
 
@@ -212,6 +332,7 @@ _OPENAPI_SPEC = {
         {"name": "system",   "description": "Health and liveness."},
         {"name": "scrape",   "description": "Trigger Amazon Fresh scrapes."},
         {"name": "products", "description": "Read the latest scrape output."},
+        {"name": "cart",     "description": "Add Amazon Fresh products to the cart by name."},
     ],
     "paths": {
         "/health": {
@@ -288,6 +409,82 @@ _OPENAPI_SPEC = {
                     },
                     "409": {
                         "description": "A scrape is already running.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"},
+                        }},
+                    },
+                },
+            },
+        },
+        "/api/cart": {
+            "get": {
+                "tags": ["cart"],
+                "summary": "Get the result of the last add-to-cart run",
+                "description": (
+                    "Returns how each requested name resolved: `added` (matched + put in "
+                    "the cart) vs `not_found` (no confident match)."
+                ),
+                "responses": {
+                    "200": {
+                        "description": "Cart run completed.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/CartResult"},
+                        }},
+                    },
+                    "202": {
+                        "description": "A cart run is currently in progress.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Running"},
+                        }},
+                    },
+                    "404": {
+                        "description": "No cart run has been started yet.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"},
+                        }},
+                    },
+                    "500": {
+                        "description": "The last cart run errored.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/ScrapeError"},
+                        }},
+                    },
+                },
+            },
+            "post": {
+                "tags": ["cart"],
+                "summary": "Add Amazon Fresh products to the cart by name",
+                "description": (
+                    "Searches Amazon Fresh for each name, fuzzy-matches the best result, and "
+                    "adds one unit of it to the cart. Unmatched names are skipped and reported. "
+                    "Never proceeds to checkout. Returns `202 started` immediately; poll "
+                    "`GET /api/cart` for the result."
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {"application/json": {
+                        "schema": {"$ref": "#/components/schemas/CartRequest"},
+                        "example": {"products": [
+                            "Amazon Brand - Vedaka Organic Toor Dal, 500g",
+                            "Amul Gold Full Cream Milk 500ml",
+                        ]},
+                    }},
+                },
+                "responses": {
+                    "202": {
+                        "description": "Add-to-cart started.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/CartStarted"},
+                        }},
+                    },
+                    "400": {
+                        "description": "Missing or malformed products array.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"},
+                        }},
+                    },
+                    "409": {
+                        "description": "A scrape or cart run is already in progress.",
                         "content": {"application/json": {
                             "schema": {"$ref": "#/components/schemas/Error"},
                         }},
@@ -375,6 +572,61 @@ _OPENAPI_SPEC = {
                     "availability":              {"type": "string", "nullable": True, "example": "Available"},
                     "source":                    {"type": "string", "nullable": True, "example": "Amazon"},
                     "scraped_at":                {"type": "string", "format": "date-time", "nullable": True},
+                },
+            },
+            "CartRequest": {
+                "type": "object",
+                "required": ["products"],
+                "properties": {
+                    "products": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "string"},
+                        "description": "Product names to search on Amazon Fresh and add (one unit each).",
+                        "example": ["Amazon Brand - Vedaka Organic Toor Dal, 500g"],
+                    },
+                },
+            },
+            "CartStarted": {
+                "type": "object",
+                "properties": {
+                    "status":              {"type": "string", "example": "started"},
+                    "products_requested":  {"type": "integer", "example": 2},
+                    "message":             {"type": "string"},
+                },
+            },
+            "CartItem": {
+                "type": "object",
+                "properties": {
+                    "requested_name": {"type": "string", "example": "Amul Gold Full Cream Milk 500ml"},
+                    "matched_title":  {"type": "string", "example": "Amul Gold Homogenised Full Cream Milk, 500 ml Pouch"},
+                    "score":          {"type": "number", "example": 0.82,
+                                       "description": "difflib similarity ratio in [0, 1]."},
+                    "price":          {"type": "number", "nullable": True, "example": 35.0},
+                    "product_url":    {"type": "string", "nullable": True, "example": "https://www.amazon.in/dp/B0..."},
+                    "asin":           {"type": "string", "nullable": True, "example": "B0..."},
+                },
+            },
+            "NotFoundItem": {
+                "type": "object",
+                "properties": {
+                    "requested_name": {"type": "string"},
+                    "best_candidate": {"type": "string", "nullable": True,
+                                       "description": "Closest title seen, even though it was below threshold."},
+                    "score":          {"type": "number", "example": 0.41},
+                    "reason":         {"type": "string", "nullable": True,
+                                       "example": "best score 0.41 below threshold 0.6"},
+                },
+            },
+            "CartResult": {
+                "type": "object",
+                "properties": {
+                    "requested":  {"type": "integer", "example": 2},
+                    "added":      {"type": "array", "items": {"$ref": "#/components/schemas/CartItem"}},
+                    "not_found":  {"type": "array", "items": {"$ref": "#/components/schemas/NotFoundItem"}},
+                    "cart_count": {"type": "integer", "example": 5,
+                                   "description": "Total items in the cart after the run (nav badge)."},
+                    "added_at":   {"type": "string", "format": "date-time"},
                 },
             },
         }
