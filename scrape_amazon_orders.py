@@ -88,14 +88,23 @@ AMAZON_ORDERS = "https://www.amazon.in/your-orders/orders?_encoding=UTF8&orderFi
 
 # Amazon Fresh availability/price is per-delivery-location. With no location set
 # for the session, Fresh product pages render "currently unavailable" and no
-# price. After login we set a deliverable location so every product page reports
-# real data: first try to pick the saved address starting with
-# DEFAULT_ADDRESS_PREFIX, and only fall back to entering DEFAULT_PINCODE if that
-# address can't be found. Override via DELIVERY_ADDRESS_PREFIX / DELIVERY_PINCODE.
-DEFAULT_ADDRESS_PREFIX = "82, Flat No 6"
-DEFAULT_PINCODE = "560094"
+# price. After login we set a deliverable location: first try to pick the saved
+# address whose text contains DELIVERY_ADDRESS_PREFIX, and only fall back to
+# entering DELIVERY_PINCODE if that address can't be found.
+#
+# These are intentionally EMPTY here — the real address/pincode are personal
+# (PII) and must NOT live in the repo. Supply them via the environment
+# (DELIVERY_ADDRESS_PREFIX / DELIVERY_PINCODE) in your local .env or the
+# Render/Railway dashboard. With neither set, location selection is skipped and
+# Fresh items report as unavailable.
+DEFAULT_ADDRESS_PREFIX = ""
+DEFAULT_PINCODE = ""
 
 ORDERS_REPORT_FILE = Path("orders_report.json")
+
+# Default Playwright storage_state file caching the logged-in Amazon session.
+# Overridable via AMAZON_AUTH_STATE_PATH. Gitignored — holds session cookies.
+DEFAULT_AUTH_STATE_FILE = Path("auth_state.json")
 
 # Marker substrings that identify an Amazon Fresh order on the order list/details.
 FRESH_MARKERS = (
@@ -124,23 +133,48 @@ def default_orders_to_scrape() -> int:
 
 def delivery_pincode() -> str:
     """Delivery pincode used to set Amazon's location so Fresh items report
-    correct availability/price. Reads DELIVERY_PINCODE from the environment
-    and falls back to DEFAULT_PINCODE when unset or not a 6-digit code."""
+    correct availability/price. Reads DELIVERY_PINCODE from the environment;
+    returns "" (no pincode) when unset or not a 6-digit code. The pincode is
+    personal — there is no hard-coded fallback in the repo."""
     raw = (os.getenv("DELIVERY_PINCODE") or "").strip()
     if re.fullmatch(r"\d{6}", raw):
         return raw
     if raw:
-        print(f"[config] DELIVERY_PINCODE={raw!r} is not a 6-digit code; using {DEFAULT_PINCODE}.")
+        print(f"[config] DELIVERY_PINCODE={raw!r} is not a 6-digit code; ignoring it.")
     return DEFAULT_PINCODE
 
 
 def delivery_address_prefix() -> str:
     """Saved Amazon address to prefer when setting the delivery location.
     Matched as a substring against each saved address in the "Deliver to"
-    popover. Reads DELIVERY_ADDRESS_PREFIX, falling back to
-    DEFAULT_ADDRESS_PREFIX."""
+    popover. Reads DELIVERY_ADDRESS_PREFIX; returns "" when unset. The address
+    is personal — there is no hard-coded fallback in the repo."""
     raw = (os.getenv("DELIVERY_ADDRESS_PREFIX") or "").strip()
     return raw or DEFAULT_ADDRESS_PREFIX
+
+
+def auth_state_path() -> Path:
+    """Path to the Playwright storage_state file that caches the Amazon session
+    (cookies + localStorage) so subsequent runs can skip login. Reads
+    AMAZON_AUTH_STATE_PATH, defaulting to auth_state.json in the working dir.
+
+    NOTE: this file holds live session cookies — it is gitignored and must
+    never be committed."""
+    raw = (os.getenv("AMAZON_AUTH_STATE_PATH") or "").strip()
+    return Path(raw) if raw else DEFAULT_AUTH_STATE_FILE
+
+
+def session_reuse_enabled() -> bool:
+    """Whether to reuse a previously saved Amazon session. OPT-IN: disabled
+    unless AMAZON_SESSION_REUSE is set to true/1/yes.
+
+    Defaults OFF so every environment (local, Render, Railway) keeps the proven
+    full-login behavior until explicitly enabled — cloud filesystems are
+    ephemeral and wouldn't persist the session across restarts anyway. Set
+    AMAZON_SESSION_REUSE=true (e.g. in a local .env) to skip login/OTP on repeat
+    runs."""
+    raw = (os.getenv("AMAZON_SESSION_REUSE") or "").strip().lower()
+    return raw in ("true", "1", "yes")
 
 
 # ---------------------------------------------------------------------------
@@ -748,15 +782,34 @@ async def _set_delivery_location(page, address_prefix: str, pincode: str) -> boo
     entering `pincode` if that address can't be found. The choice persists in a
     session cookie, so every product page visited afterwards reports real data.
 
+    Either argument may be empty (neither is hard-coded — they come from the
+    DELIVERY_ADDRESS_PREFIX / DELIVERY_PINCODE env vars). Empty steps are
+    skipped; with both empty, location selection is skipped entirely and Fresh
+    items report as unavailable.
+
     Best-effort: logs a warning and returns False if the widget can't be
     driven, so the scrape still proceeds."""
+    if not address_prefix and not pincode:
+        print(
+            "[location] No delivery location configured — set DELIVERY_ADDRESS_PREFIX "
+            "and/or DELIVERY_PINCODE (env / .env / dashboard). Skipping; Fresh items "
+            "may report as unavailable."
+        )
+        return False
     if not await _open_location_popover(page):
         print("[location] Location popover unavailable; continuing without setting it.")
         return False
-    if await _select_saved_address(page, address_prefix):
+    if address_prefix and await _select_saved_address(page, address_prefix):
         return True
-    print(f"[location] Falling back to pincode {pincode}.")
-    return await _enter_pincode(page, pincode)
+    if pincode:
+        if address_prefix:
+            print(f"[location] No saved address matched {address_prefix!r}; falling back to pincode {pincode}.")
+        return await _enter_pincode(page, pincode)
+    print(
+        f"[location] No saved address matched {address_prefix!r} and no DELIVERY_PINCODE "
+        f"set; leaving Amazon's default location."
+    )
+    return False
 
 
 async def _goto_with_retry(page, url: str, attempts: int = 3) -> None:
@@ -1165,9 +1218,31 @@ async def open_logged_in_page(pw, headless: bool):
         args=browser_args,
     )
 
-    context = await browser.new_context(
-        viewport={"width": 1280, "height": 800},
-    )
+    # ---- Reuse a saved session if one exists (skips login + OTP) ----
+    state_path = auth_state_path()
+    reuse = session_reuse_enabled() and state_path.exists()
+    base_kwargs = {"viewport": {"width": 1280, "height": 800}}
+    if reuse:
+        print(f"[auth] Reusing saved session from {state_path}.")
+        try:
+            context = await browser.new_context(storage_state=str(state_path), **base_kwargs)
+        except Exception as exc:
+            # Corrupt/unreadable state file — discard it and start clean rather
+            # than crash. The fresh-login path below will recreate it.
+            print(f"[auth] Saved session at {state_path} is unusable ({exc}); ignoring it.")
+            try:
+                state_path.unlink()
+            except OSError:
+                pass
+            reuse = False
+            context = await browser.new_context(**base_kwargs)
+    else:
+        if session_reuse_enabled():
+            print(f"[auth] No saved session at {state_path}; will log in.")
+        else:
+            print("[auth] Session reuse disabled (AMAZON_SESSION_REUSE) — logging in.")
+        context = await browser.new_context(**base_kwargs)
+
     page = await context.new_page()
 
     # Abort image/media/font requests — not needed for data extraction and
@@ -1180,8 +1255,33 @@ async def open_logged_in_page(pw, headless: bool):
 
     await page.route("**/*", _block_heavy)
 
-    # ---- Login ----
-    await login(page, amazon_username, amazon_password, headless)
+    # ---- Login (skipped when a saved session is still valid) ----
+    logged_in = False
+    if reuse:
+        # The orders page redirects to /ap/signin when logged out, so loading it
+        # is a reliable validity check (this is is_logged_in's documented contract).
+        print("[auth] Validating saved session…")
+        await _goto_with_retry(page, AMAZON_ORDERS)
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10_000)
+        except PlaywrightTimeoutError:
+            pass
+        logged_in = await is_logged_in(page)
+        if logged_in:
+            print("[auth] Saved session is still valid — skipping login.")
+        else:
+            print("[auth] Saved session expired — logging in again.")
+
+    if not logged_in:
+        await login(page, amazon_username, amazon_password, headless)
+
+    # ---- Persist the (re)authenticated session for the next run ----
+    try:
+        await context.storage_state(path=str(state_path))
+        print(f"[auth] Session saved to {state_path}.")
+    except Exception as exc:
+        # Login already succeeded — a save failure is non-fatal.
+        print(f"[auth] Warning: could not save session to {state_path}: {exc}")
 
     # ---- Set delivery location so Fresh items report correct availability ----
     print("[nav] Navigating home to set delivery location…")

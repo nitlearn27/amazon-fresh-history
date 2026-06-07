@@ -52,12 +52,29 @@ If Amazon shows a captcha, the scrape stops with a screenshot and a clear
 error. Re-run locally in headed mode (`--headed=true`) to solve it once by
 hand; captchas do not recur once Amazon trusts the browser fingerprint.
 
+### Session reuse (fewer logins / OTPs) — opt-in
+
+By default every run does a full login. **Opt in** by setting
+`AMAZON_SESSION_REUSE=true` (e.g. in your local `.env`). When enabled, the
+browser session (cookies + localStorage) is saved to `auth_state.json` after
+login; the next run loads the orders page to check it's still valid and, if so,
+**skips login and OTP entirely**. An expired or corrupt session falls back to a
+full login (and re-save). So you typically OTP once, then run freely until Amazon
+logs the session out (usually days).
+
+- It's **off by default** so cloud deploys keep the proven full-login behavior —
+  Render/Railway use an **ephemeral** filesystem, so `auth_state.json` does not
+  survive a deploy/restart and reuse only helps within one container's lifetime.
+- `auth_state.json` holds live session cookies — it's gitignored; never commit it.
+- To turn it off again (or recover from a bad state): set
+  `AMAZON_SESSION_REUSE=false` (or just unset it) and/or delete `auth_state.json`.
+- `AMAZON_AUTH_STATE_PATH` overrides the file location (default `auth_state.json`).
+
 ### OTP / 2-step verification
 
-Every run does a fresh login (no session is cached). Amazon may ask for a
-2-step verification code. When it does, the scraper polls
-`Purchase_Info__c.my_amazon_otp__c` in Salesforce every 5 s for up to
-3 minutes — paste the OTP Amazon sent into that field and save; the scraper
+When a login *is* needed, Amazon may ask for a 2-step verification code. The
+scraper polls `Purchase_Info__c.my_amazon_otp__c` in Salesforce every 5 s for up
+to 3 minutes — paste the OTP Amazon sent into that field and save; the scraper
 picks it up automatically, submits it, and immediately blanks the field.
 
 This works the same way in headed local runs and headless Render runs.
@@ -69,12 +86,14 @@ set, every Fresh product page reports *"currently unavailable"* and no price.
 So right after login the scraper sets the "Deliver to" location:
 
 1. It first tries to select the saved address whose text contains
-   `DELIVERY_ADDRESS_PREFIX` (default `82, Flat No 6`).
-2. If no matching saved address is found, it enters `DELIVERY_PINCODE`
-   (default `560094`).
+   `DELIVERY_ADDRESS_PREFIX`.
+2. If no matching saved address is found, it enters `DELIVERY_PINCODE`.
 
-Both are optional env vars — the built-in defaults work without configuration.
-Set `DELIVERY_ADDRESS_PREFIX` to a substring unique to the address you want.
+Both are **personal (PII), so there are no hard-coded defaults** — set them in
+your `.env` locally and in the Render/Railway dashboard in production. Set
+`DELIVERY_ADDRESS_PREFIX` to a substring unique to the address you want and
+`DELIVERY_PINCODE` to your 6-digit pincode. With neither set, location selection
+is skipped and Fresh items report as *"currently unavailable"*.
 
 ### Salesforce Connected App
 
@@ -174,8 +193,10 @@ flow. `render.yaml` declares every env var the service expects.
    | `SF_API_ENDPOINT`         | `…/services/data/v57.0/sobjects/Grocery_Product__c/`             |
    | `HEADLESS`                | `true` (already set in `render.yaml`)                            |
    | `ORDERS_TO_SCRAPE`        | _(optional)_ default order count; `10` in `render.yaml`          |
-   | `DELIVERY_ADDRESS_PREFIX` | _(optional)_ saved-address substring to deliver to; default `82, Flat No 6` |
-   | `DELIVERY_PINCODE`        | _(optional)_ pincode fallback; `560094` in `render.yaml`         |
+   | `DELIVERY_ADDRESS_PREFIX` | _(personal)_ saved-address substring to deliver to; set in dashboard, not in repo |
+   | `DELIVERY_PINCODE`        | _(personal)_ 6-digit pincode fallback; set in dashboard, not in repo |
+   | `AMAZON_AUTH_STATE_PATH`  | _(optional)_ session-cache file path; default `auth_state.json`  |
+   | `AMAZON_SESSION_REUSE`    | _(optional)_ `true` enables session reuse; default `false` (off; `render.yaml` pins it off) |
 
    Only `AMAZON_*` are strictly required to deploy. The `SF_*` block enables
    Salesforce sync + the OTP bridge; the rest have working defaults.

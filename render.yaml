@@ -30,13 +30,23 @@ services:
       - key: ORDERS_TO_SCRAPE
         value: "10"
 
+      # ── Session caching (opt-in; default off in code too) ────────────────
+      # Session reuse saves the logged-in session to auth_state.json so repeat
+      # runs skip login/OTP. It is OFF by default everywhere; this pins it off
+      # in production explicitly. On Render the container filesystem is EPHEMERAL
+      # — auth_state.json does not survive a deploy/restart, so reuse would only
+      # help within a single container's lifetime. Set to "true" in the dashboard
+      # to experiment, or back to "false" to revert instantly.
+      - key: AMAZON_SESSION_REUSE
+        value: "false"
+
       # ── Delivery location (sets Amazon "Deliver to" so Fresh items show ───
       #    correct availability/price) ────────────────────────────────────
-      # Preferred saved address (substring match). Account-specific, so set it
-      # in the dashboard; if left unset the code falls back to its built-in
-      # default. Only used when a matching saved address exists for the account.
+      # Both are PERSONAL (PII) — set them in the dashboard, never in this file.
+      # Preferred saved address (substring match); used when a matching saved
+      # address exists for the account.
       - key: DELIVERY_ADDRESS_PREFIX
         sync: false
       # Pincode fallback used when no saved address matches the prefix above.
       - key: DELIVERY_PINCODE
-        value: "560094"
+        sync: false

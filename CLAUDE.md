@@ -89,9 +89,11 @@ designed for local development and cloud deployment on **Render** (Docker-based)
 |---|---|
 | `HEADLESS` | `false` locally, `true` in Docker |
 | `PORT` | `10000` (Render sets this automatically) |
+| `AMAZON_AUTH_STATE_PATH` | `auth_state.json` — Playwright `storage_state` file caching the logged-in session (cookies + localStorage) so later runs skip login/OTP. Only used when reuse is enabled. Gitignored; holds live session cookies — never commit it. |
+| `AMAZON_SESSION_REUSE` | **`false`** (opt-in) — unset means full login every run. Set to `true`/`1`/`yes` to save and reuse the session. Left off by default so cloud deploys (ephemeral FS) keep the proven login behavior. |
 | `ORDERS_TO_SCRAPE` | `10` — fallback for both `scrape_amazon_orders.py` (when `--orders` is omitted) and `POST /api/products` (when the request body omits `"orders"`). Explicit values still override. |
-| `DELIVERY_ADDRESS_PREFIX` | `82, Flat No 6` — after login the scraper first tries to pick the saved "Deliver to" address whose text contains this substring; only if no match is found does it fall back to `DELIVERY_PINCODE`. |
-| `DELIVERY_PINCODE` | `560094` — 6-digit pincode entered as Amazon's "Deliver to" location when no saved address matches `DELIVERY_ADDRESS_PREFIX`. Fresh availability/price is per-location; with none set, items show "currently unavailable". |
+| `DELIVERY_ADDRESS_PREFIX` | _(empty)_ — after login the scraper first tries to pick the saved "Deliver to" address whose text contains this substring; only if no match is found does it fall back to `DELIVERY_PINCODE`. **Personal (PII)** — set it via env / `.env` / dashboard; no value is hard-coded in the repo. |
+| `DELIVERY_PINCODE` | _(empty)_ — 6-digit pincode entered as Amazon's "Deliver to" location when no saved address matches `DELIVERY_ADDRESS_PREFIX`. Fresh availability/price is per-location; with neither var set, location selection is skipped and items show "currently unavailable". **Personal (PII)** — set via env, not in the repo. |
 
 ## Environment Setup (Local)
 
@@ -142,9 +144,15 @@ python scrape_amazon_orders.py --headed=false   # headless
 ## High-Level Scraping Flow
 
 1. **Launch Chromium** (headed locally, headless in Docker).
-2. **Login** via email/password every run (no session is cached):
-   - Navigate directly to `/ap/signin`, fill `AMAZON_USERNAME` → Continue,
-     then fill `AMAZON_PASSWORD` → Sign In.
+2. **Login** (in `open_logged_in_page`) — full login by default:
+   - Navigate to `/ap/signin`, fill `AMAZON_USERNAME` → Continue, then
+     `AMAZON_PASSWORD` → Sign In.
+   - **Optional session reuse (opt-in via `AMAZON_SESSION_REUSE=true`):** if a
+     saved `auth_state.json` exists, the context is created from it and validated
+     by loading the orders page (it redirects to `/ap/signin` when logged out). A
+     valid session **skips login and OTP entirely**; an expired/corrupt one falls
+     back to the full login above. After any successful login the session is
+     saved back to `auth_state.json`. Disabled by default.
    - **Captcha**: if Amazon shows one, stop. Re-run locally headed to solve once.
    - **2-step verification OTP**: poll `Purchase_Info__c.my_amazon_otp__c` in
      Salesforce every 5 s for up to 3 minutes — works in both headed and
@@ -219,8 +227,11 @@ When a selector fails:
 ### How it works
 
 - Render builds the `Dockerfile` (Python 3.11-slim + Playwright Chromium).
-- Every scrape does a full login (email + password). No session is cached or
-  persisted — no auth state env var needed.
+- Every run does a full login (email + password). Session reuse is **off in the
+  cloud by default** (`AMAZON_SESSION_REUSE=false` in `render.yaml`) because the
+  container disk is ephemeral — `auth_state.json` wouldn't survive a
+  deploy/restart anyway. It can be flipped to `true` in the dashboard to reuse
+  the session within a single container's lifetime.
 - Scraping runs headless inside the container.
 
 ### Deploy steps
@@ -238,8 +249,14 @@ When a selector fails:
 - **Amazon is aggressive at bot detection.** The first login from a new
   IP/device usually triggers a captcha and/or OTP. Captchas require a headed
   local run to solve by hand. OTPs are handled via the Salesforce bridge (see below).
-- **No session caching.** Every scrape does a full login. Amazon may ask for
-  OTP on any run if it considers the request suspicious.
+- **Login every run by default.** Session caching is **opt-in**
+  (`AMAZON_SESSION_REUSE=true`) and off unless explicitly enabled, so the default
+  path is a full login (and possible OTP) on every run. When enabled, the session
+  is saved to `auth_state.json` and reused so most runs skip login/OTP — but
+  Amazon still expires sessions and may challenge, so the full-login + OTP path
+  must always keep working. On Render/Railway the file lives on an **ephemeral**
+  disk: it persists only within a running container's lifetime, not across
+  deploys/restarts — which is why reuse defaults off in the cloud.
 - **Wrong password / locked account.** Amazon shows the same "Sign in" page
   after a bad submit. The scraper detects this and exits with a screenshot.
 - **Fresh orders may be empty.** If your account has no recent Amazon Fresh
