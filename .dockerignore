@@ -7,7 +7,9 @@ auth_state.json
 auth_state.json.bak.*
 orders_report.json
 *.png
+*.log
 *.md
+.vscode/
 .git/
 .gitignore
 .dockerignore
