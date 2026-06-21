@@ -15,11 +15,13 @@ report containing:
    visiting each unique product page once.
 
 After each successful scrape, the report is also pushed to **Salesforce**: each
-unique product title is matched against `Grocery_Product__c.title__c`, and
-matching records get `number_of_times_purchased__c`, `last_ordered_date__c`,
-`current_price__c`, `last_purchased_price__c`, `product_url__c`, `image_url__c`,
-`availability__c`, `source__c` (= `"Amazon"`), and `scraped_at__c` updated.
-**No new records are ever created** — non-matching titles are skipped.
+unique product title is upserted into `Grocery_Product__c` using `title__c` as the
+external ID — existing titles are updated, new titles are created — setting
+`number_of_times_purchased__c`, `last_ordered_date__c`, `current_price__c`,
+`last_purchased_price__c`, `product_url__c`, `image_url__c`, `availability__c`,
+`source__c`, and `scraped_at__c`. `source__c` is per-product: `"Amazon Now"` for
+items from Amazon Now (the `/tez/` quick-commerce service) and `"Amazon Fresh"`
+for classic Amazon Fresh items.
 
 Note the price distinction: `current_price__c` is the live price read from the
 product page (and also the sole determinant of `availability__c` — priced
@@ -40,7 +42,7 @@ designed for local development and cloud deployment on **Render** (Docker-based)
 |---|---|
 | Language | Python 3.11 |
 | Browser automation | Playwright (async) + Chromium |
-| Login | amazon.in email/phone + password (no OTP/Gmail dependency) |
+| Login | amazon.in email/phone + password; 2-step OTP pushed via `POST /api/otp` (no Gmail dependency) |
 | Salesforce sync | REST API + OAuth 2.0 client_credentials (Connected App) |
 | Web service | Flask 3 |
 | API docs | Swagger UI (CDN) backed by OpenAPI 3.0 spec at `/openapi.json` |
@@ -62,6 +64,7 @@ designed for local development and cloud deployment on **Render** (Docker-based)
 ├── app.py                   # Flask web service (entry point) + Swagger UI at /docs
 ├── scrape_amazon_orders.py  # Core scraping logic; calls salesforce_sync at end
 ├── amazon_cart.py           # Add Fresh products to cart by name (search + fuzzy match)
+├── otp_store.py             # In-process, short-TTL store for the 2-step OTP push
 └── salesforce_sync.py       # OAuth + PATCH Grocery_Product__c.title__c matches
 ```
 
@@ -92,6 +95,7 @@ designed for local development and cloud deployment on **Render** (Docker-based)
 | `AMAZON_AUTH_STATE_PATH` | `auth_state.json` — Playwright `storage_state` file caching the logged-in session (cookies + localStorage) so later runs skip login/OTP. Only used when reuse is enabled. Gitignored; holds live session cookies — never commit it. |
 | `AMAZON_SESSION_REUSE` | **`false`** (opt-in) — unset means full login every run. Set to `true`/`1`/`yes` to save and reuse the session. Left off by default so cloud deploys (ephemeral FS) keep the proven login behavior. |
 | `ORDERS_TO_SCRAPE` | `10` — fallback for both `scrape_amazon_orders.py` (when `--orders` is omitted) and `POST /api/products` (when the request body omits `"orders"`). Explicit values still override. |
+| `OTP_TTL_SECONDS` | `300` — how long an OTP pushed to `POST /api/otp` stays valid before it is treated as stale. Short by design; the code is also cleared the instant it is consumed. |
 | `DELIVERY_ADDRESS_PREFIX` | _(empty)_ — after login the scraper first tries to pick the saved "Deliver to" address whose text contains this substring; only if no match is found does it fall back to `DELIVERY_PINCODE`. **Personal (PII)** — set it via env / `.env` / dashboard; no value is hard-coded in the repo. |
 | `DELIVERY_PINCODE` | _(empty)_ — 6-digit pincode entered as Amazon's "Deliver to" location when no saved address matches `DELIVERY_ADDRESS_PREFIX`. Fresh availability/price is per-location; with neither var set, location selection is skipped and items show "currently unavailable". **Personal (PII)** — set via env, not in the repo. |
 
@@ -126,6 +130,8 @@ PORT=3001 HEADLESS=false python app.py
 | `POST` | `/api/products` | Start a scrape (runs in background thread). Body: `{"orders": <int>}`, default 10 |
 | `GET` | `/api/cart` | Result of the last add-to-cart run: `{requested, added[], not_found[], cart_count}` |
 | `POST` | `/api/cart` | Add Amazon Fresh products to the cart by name (background thread). Body: `{"products": [<str>, ...]}` |
+| `GET` | `/api/otp` | Is a run currently waiting for a 2-step OTP? `{waiting, waiting_since, ttl_seconds}` |
+| `POST` | `/api/otp` | Hand the 2-step verification OTP to a waiting run. Body: `{"otp": "<4-8 digits>"}` |
 
 Scrapes and cart runs share the single Amazon account and cannot overlap — the
 second concurrent `POST` returns `409`.
@@ -154,10 +160,13 @@ python scrape_amazon_orders.py --headed=false   # headless
      back to the full login above. After any successful login the session is
      saved back to `auth_state.json`. Disabled by default.
    - **Captcha**: if Amazon shows one, stop. Re-run locally headed to solve once.
-   - **2-step verification OTP**: poll `Purchase_Info__c.my_amazon_otp__c` in
-     Salesforce every 5 s for up to 3 minutes — works in both headed and
-     headless mode. Paste the OTP into that field and save; the scraper picks
-     it up, submits it, and immediately nulls the field.
+   - **2-step verification OTP**: the run blocks on an in-process store
+     (`otp_store`) for up to 3 minutes — works in both headed and headless mode.
+     `POST /api/otp {"otp": "..."}` hands it the code; it submits the OTP within
+     ~1 s. The code lives in memory only and expires after `OTP_TTL_SECONDS`
+     (default 300 s) so a stale code is never reused. In a headed local browser
+     you can alternatively just type the OTP into Amazon directly — the run
+     detects the screen advancing and continues.
 3. **Set the delivery location** (so Fresh items report correct availability/
    price): open the "Deliver to" popover and first try to pick the saved
    address containing `DELIVERY_ADDRESS_PREFIX`; only if that's not found,
@@ -215,7 +224,7 @@ When a selector fails:
       "image_url": "https://m.media-amazon.com/images/I/...",
       "category": "Grocery",
       "availability": "Available",
-      "source": "Amazon",
+      "source": "Amazon Fresh",
       "scraped_at": "2026-05-26T10:15:00+05:30"
     }
   ]
@@ -241,14 +250,14 @@ When a selector fails:
 3. Add environment variables in Render dashboard (see table above).
 4. Deploy. Trigger a scrape via `POST /api/products`.
 5. If Amazon asks for OTP, watch the Render logs for the `[auth] ACTION REQUIRED`
-   line, then paste the code into `Purchase_Info__c.my_amazon_otp__c` in
-   Salesforce. The scraper will pick it up within 5 seconds.
+   line (or poll `GET /api/otp` for `waiting: true`), then `POST /api/otp` with
+   the code. The scraper picks it up within ~1 second.
 
 ## Amazon login pitfalls
 
 - **Amazon is aggressive at bot detection.** The first login from a new
   IP/device usually triggers a captcha and/or OTP. Captchas require a headed
-  local run to solve by hand. OTPs are handled via the Salesforce bridge (see below).
+  local run to solve by hand. OTPs are handled via the `/api/otp` push (see below).
 - **Login every run by default.** Session caching is **opt-in**
   (`AMAZON_SESSION_REUSE=true`) and off unless explicitly enabled, so the default
   path is a full login (and possible OTP) on every run. When enabled, the session
@@ -263,25 +272,35 @@ When a selector fails:
   orders, the report is written with `products: []` rather than erroring —
   the Salesforce sync then no-ops cleanly.
 
-### OTP via Salesforce (2FA bridge — all modes)
+### OTP via `/api/otp` (2FA push — all modes)
 
-When Amazon presents the 2-step verification (OTP) screen — in any mode,
-headed or headless — the scraper uses Salesforce as a side-channel:
+When Amazon presents the 2-step verification (OTP) screen — in any mode, headed
+or headless — the run blocks on an in-process store (`otp_store.py`) and waits
+for the code to be pushed over HTTP:
 
-1. The scraper polls `Purchase_Info__c.my_amazon_otp__c` every 5 seconds
-   for up to 3 minutes.
-2. You watch the email/SMS Amazon just sent, then paste the OTP into that
-   field on the single `Purchase_Info__c` record and save.
-3. The scraper picks up the value, types it into Amazon, and immediately
-   nulls the field so the next run does not see a stale OTP.
-4. If 3 minutes elapse with the field empty, the scraper exits with a
-   screenshot and a clear error so the run can be retried.
+1. The run marks the store as *waiting* and blocks for up to 3 minutes, checking
+   the store every second. `GET /api/otp` reports `waiting: true`; the log prints
+   an `[auth] ACTION REQUIRED` line.
+2. You watch the email/SMS Amazon just sent, then `POST /api/otp` with
+   `{"otp": "123456"}`.
+3. The run consumes the code (clearing it from memory immediately), types it into
+   Amazon, and continues. The code also self-expires after `OTP_TTL_SECONDS`
+   (default 300 s), so a stale value can never reach a later login.
+4. If 3 minutes elapse with no push, the run exits with a screenshot and a clear
+   error so it can be retried.
 
-Connected App requirements: the "Run As" user must have **Read** and
-**Edit** permission on `Purchase_Info__c` and the `my_amazon_otp__c`
-field, in addition to the existing `Grocery_Product__c` permissions. No
-new env vars — the bridge reuses `SF_TOKEN_URL`, `SF_CLIENT_ID`,
-`SF_CLIENT_SECRET`, `SF_API_ENDPOINT`.
+This is wholly in-process: no Salesforce, no extra Connected App permissions,
+and the OTP never leaves the running container's memory. `POST /api/otp` only
+accepts a code while a run is actually waiting (otherwise `409`). In a headed
+local browser you can skip the API entirely and type the OTP straight into
+Amazon — the run detects the screen advancing and carries on.
+
+> **Single-tenant / in-memory caveat:** the store holds one OTP for the one
+> Amazon account, and only one scrape/cart run can be in flight at a time, so a
+> single global slot is sufficient. Because the code lives only in the process's
+> memory, the `POST /api/otp` must hit the **same** running instance that is
+> waiting — fine for a single Render/Railway web service, but it would not work
+> across multiple replicas.
 
 ## Salesforce sync notes
 
@@ -291,8 +310,8 @@ new env vars — the bridge reuses `SF_TOKEN_URL`, `SF_CLIENT_ID`,
   - Match field: `title__c`
   - Updated fields: `number_of_times_purchased__c`, `last_ordered_date__c`,
     `current_price__c`, `last_purchased_price__c`, `product_url__c`,
-    `image_url__c`, `category__c`, `availability__c`, `source__c` (= `"Amazon"`),
-    `scraped_at__c`
+    `image_url__c`, `category__c`, `availability__c`, `source__c`
+    (= `"Amazon Now"` or `"Amazon Fresh"`, per product), `scraped_at__c`
   - `current_price__c` = live product-page price; `last_purchased_price__c` =
     price paid in the most recent order for that product (from the order item
     list, NOT the product page).
@@ -332,7 +351,10 @@ Cart-specific selectors live in `CART_SELECTORS` at the top of `amazon_cart.py`
 
 - No checkout, purchase, payment, cancel, or return. (Adding to cart via
   `POST /api/cart` is in scope; everything past the cart is not.)
-- No scraping beyond Amazon Fresh orders (other Amazon orders are skipped).
-- No creation of new Salesforce records — sync only updates existing titles.
+- Scraping covers Amazon Fresh **and** Amazon Now orders; other Amazon orders
+  (regular retail) are skipped.
+- Salesforce sync **upserts** by `title__c` (external ID): existing titles are
+  updated, new titles are created. (Historically documented as update-only; the
+  code actually creates on first sight.)
 - No captcha solving — captchas always require a one-time headed local run.
 - No multi-user support — the service is single-tenant (one Amazon account).

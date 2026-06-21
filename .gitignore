@@ -9,6 +9,9 @@ orders_report.json
 *.pyc
 *.png
 *.log
+# Debug / exploration artifacts written at runtime
+*_debug.html
+explore_now/
 .vscode/
 .claude/
 .DS_Store

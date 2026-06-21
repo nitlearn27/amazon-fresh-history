@@ -9,6 +9,8 @@ orders_report.json
 *.png
 *.log
 *.md
+*_debug.html
+explore_now/
 .vscode/
 .git/
 .gitignore

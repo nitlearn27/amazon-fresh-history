@@ -1,7 +1,8 @@
 """
 Amazon Fresh (amazon.in) order history scraper.
-Login: email/phone + password. OTP (2-step verification) is polled from
-Salesforce Purchase_Info__c.my_amazon_otp__c in headless mode.
+Login: email/phone + password. When Amazon asks for a 2-step verification OTP,
+the scraper blocks on an in-process store (otp_store) that a client fills by
+POSTing the code to /api/otp. Works in both headed and headless mode.
 """
 
 import argparse
@@ -85,6 +86,18 @@ AMAZON_SIGNIN = (
     "&openid.ns=http%3A%2F%2Fspecs.openid.net%2Fauth%2F2.0"
 )
 AMAZON_ORDERS = "https://www.amazon.in/your-orders/orders?_encoding=UTF8&orderFilter=months-6"
+
+# --- Amazon Now (quick-commerce, the "/tez/" SPA) ---------------------------
+# Some recent Fresh-looking orders are actually Amazon Now orders. Their
+# order-details deep link (/uff/...order-details) redirects into the /tez/ SPA,
+# whose page often loads as an error — but the SPA fetches its data from a clean
+# JSON endpoint we can call directly with the logged-in session's cookies:
+#   GET /tez/order/getOrderDetails?orderId=<id>&pageType=orderDetail&brandId=<brand>
+# returning data.orderDetailsResponse.orderItems[] (asin, title, prices, qty).
+# brandId is Amazon Now India's storefront id; if Amazon rotates it the call
+# 404s and we fall back to the empty-order diagnostics.
+AMAZON_NOW_ORDER_API = "https://www.amazon.in/tez/order/getOrderDetails"
+AMAZON_NOW_BRAND_ID = "qqfsWw9RkO"
 
 # Amazon Fresh availability/price is per-delivery-location. With no location set
 # for the session, Fresh product pages render "currently unavailable" and no
@@ -286,63 +299,52 @@ async def _handle_captcha_block(page) -> None:
         sys.exit(1)
 
 
-async def _poll_salesforce_for_otp(
-    poll_interval_seconds: int = 5,
+# Sentinel returned by _wait_for_otp when a human typed the code straight into a
+# headed browser and the OTP screen advanced on its own — no fill/submit needed.
+_OTP_SOLVED_MANUALLY = "__solved_manually__"
+
+
+async def _wait_for_otp(
+    otp_input,
+    poll_interval_seconds: float = 1.0,
     max_total_seconds: int = 180,
-) -> tuple[str, str] | None:
-    """Poll Salesforce for an OTP. Returns (record_id, otp) or None on timeout."""
+) -> str | None:
+    """Wait for an OTP pushed to the in-process store via POST /api/otp.
+
+    Returns the code, or _OTP_SOLVED_MANUALLY if the OTP screen advanced on its
+    own (a human typed it into a headed browser), or None on timeout.
+    """
+    from otp_store import store as otp_store
+
+    otp_store.begin_wait()
     try:
-        from salesforce_sync import (
-            OTP_FIELD,
-            OTP_OBJECT,
-            SalesforceError,
-            config_present,
-            fetch_amazon_otp,
-        )
-    except Exception as exc:
-        print(f"[auth] Could not import Salesforce OTP bridge: {exc}")
-        return None
-
-    if not config_present():
         print(
-            "[auth] Salesforce env vars are not set (SF_TOKEN_URL / SF_CLIENT_ID /"
-            " SF_CLIENT_SECRET / SF_API_ENDPOINT) — cannot poll for OTP."
+            "[auth] Amazon prompted for a 2-step verification OTP.\n"
+            "[auth] ACTION REQUIRED: POST the code to /api/otp, e.g.\n"
+            '         curl -X POST $BASE_URL/api/otp -H "Content-Type: application/json" '
+            '-d \'{"otp": "123456"}\'\n'
+            f"[auth] Waiting up to {max_total_seconds}s (code expires after "
+            "OTP_TTL_SECONDS)…"
         )
-        return None
-
-    print(
-        f"[auth] Amazon prompted for OTP. Polling Salesforce "
-        f"{OTP_OBJECT}.{OTP_FIELD} every {poll_interval_seconds}s "
-        f"(max {max_total_seconds}s)…"
-    )
-    print(
-        f"[auth] ACTION REQUIRED: open Salesforce → {OTP_OBJECT} → set "
-        f"{OTP_FIELD} to the OTP that Amazon just emailed/SMS'd, then save."
-    )
-    max_attempts = max(1, max_total_seconds // poll_interval_seconds)
-    for attempt in range(1, max_attempts + 1):
-        elapsed = (attempt - 1) * poll_interval_seconds
-        outcome = "empty"
-        try:
-            result = fetch_amazon_otp()
-        except SalesforceError as exc:
-            print(f"[auth] Salesforce OTP poll {attempt}/{max_attempts} (t={elapsed}s) failed: {exc}")
-            result = None
-            outcome = "error"
-        except Exception as exc:
-            print(f"[auth] Salesforce OTP poll {attempt}/{max_attempts} (t={elapsed}s) unexpected: {exc}")
-            result = None
-            outcome = "error"
-        if result is not None:
-            print(f"[auth] OTP received from Salesforce on attempt {attempt}/{max_attempts} (t={elapsed}s).")
-            return result
-        print(
-            f"[auth] Salesforce OTP poll {attempt}/{max_attempts} "
-            f"(t={elapsed}s) → {outcome}; sleeping {poll_interval_seconds}s…"
-        )
-        if attempt < max_attempts:
+        elapsed = 0.0
+        while elapsed < max_total_seconds:
+            code = otp_store.consume()
+            if code:
+                print(f"[auth] OTP received via /api/otp (t={int(elapsed)}s).")
+                return code
+            # Headed-browser fallback: if the code field is gone, a human solved
+            # it directly in the browser, so there is nothing left for us to fill.
+            try:
+                if not await otp_input.is_visible():
+                    print("[auth] OTP screen advanced on its own — assuming it was entered manually.")
+                    return _OTP_SOLVED_MANUALLY
+            except Exception:
+                return _OTP_SOLVED_MANUALLY
             await asyncio.sleep(poll_interval_seconds)
-    return None
+            elapsed += poll_interval_seconds
+        return None
+    finally:
+        otp_store.end_wait()
 
 
 async def _on_two_step_verification_page(page) -> bool:
@@ -413,9 +415,9 @@ async def _advance_otp_delivery_chooser(page) -> None:
 
 
 async def _handle_otp_challenge(page) -> bool:
-    """If Amazon asks for an OTP (2-step verification), poll Salesforce
-    Purchase_Info__c.my_amazon_otp__c regardless of headed/headless mode.
-    Returns True iff we entered an OTP."""
+    """If Amazon asks for an OTP (2-step verification), wait for a code pushed to
+    the in-process store via POST /api/otp, regardless of headed/headless mode.
+    Returns True iff the OTP step was satisfied."""
     # Amazon may land us on the OTP *delivery chooser* (/ap/mfa/new-otp) before
     # the code-entry field exists. Detect the 2-step flow by URL/title and click
     # "Send OTP" so the code field renders, instead of giving up immediately.
@@ -432,18 +434,26 @@ async def _handle_otp_challenge(page) -> bool:
     except PlaywrightTimeoutError:
         return False
 
-    polled = await _poll_salesforce_for_otp()
-    if polled is None:
+    otp = await _wait_for_otp(otp_input)
+    if otp is None:
         screenshot_path = Path("amazon_login_debug.png")
         await page.screenshot(path=str(screenshot_path), full_page=True)
         print(
-            "\n[error] No OTP appeared in Salesforce within the 3-minute window.\n"
-            "  • Set Purchase_Info__c.my_amazon_otp__c to the OTP that Amazon\n"
-            "    just emailed/SMS'd, then re-trigger the scrape.\n"
+            "\n[error] No OTP was pushed to /api/otp within the 3-minute window.\n"
+            "  • POST the OTP that Amazon just emailed/SMS'd to /api/otp, then\n"
+            "    re-trigger the scrape.\n"
             f"  • Screenshot: {screenshot_path.resolve()}\n"
         )
         sys.exit(1)
-    otp_record_id, otp = polled
+
+    # A human already typed the code into a headed browser — nothing to fill.
+    if otp == _OTP_SOLVED_MANUALLY:
+        try:
+            await page.wait_for_load_state("networkidle", timeout=15_000)
+        except PlaywrightTimeoutError:
+            pass
+        await _log_page_state(page, "after manual OTP entry")
+        return True
 
     if not re.fullmatch(r"\d{4,8}", otp):
         print(f"[error] {otp!r} does not look like a numeric OTP. Aborting.")
@@ -465,15 +475,7 @@ async def _handle_otp_challenge(page) -> bool:
     except PlaywrightTimeoutError:
         print("[auth] Post-OTP: networkidle did not fire within 15s (continuing).")
     await _log_page_state(page, "after OTP submit")
-
-    try:
-        from salesforce_sync import clear_amazon_otp
-        clear_amazon_otp(otp_record_id)
-        print("[auth] Cleared OTP from Salesforce.")
-    except Exception as exc:
-        # Login itself already succeeded — surface a warning but don't abort.
-        print(f"[auth] Warning: failed to clear OTP in Salesforce: {exc}")
-
+    # The in-process store already cleared the code on consume(); nothing to do.
     return True
 
 
@@ -1077,6 +1079,135 @@ async def _extract_products_from_detail_page(page) -> list[dict]:
     return raw or []
 
 
+def _extract_order_id(url: str) -> str | None:
+    """Pull the Amazon orderID from an order-details URL's query string.
+    Amazon uses `orderID` on classic links and `orderId` on /tez/ ones."""
+    try:
+        from urllib.parse import parse_qs, urlparse
+        qs = parse_qs(urlparse(url).query)
+    except Exception:
+        return None
+    for key in ("orderID", "orderId", "orderid"):
+        if qs.get(key):
+            return qs[key][0]
+    return None
+
+
+async def _fetch_amazon_now_items(page, order_id: str) -> list[dict]:
+    """Fetch an Amazon Now order's items from its JSON API using the page's
+    logged-in session cookies. Returns the same {title, href, price} shape as
+    _extract_products_from_detail_page, or [] if it's not a Now order / fails.
+
+    `price` is the per-unit offer price actually paid (totalOfferPrice / qty),
+    matching the classic flow's per-item purchased price."""
+    if not order_id:
+        return []
+    try:
+        resp = await page.request.get(
+            AMAZON_NOW_ORDER_API,
+            params={
+                "orderId": order_id,
+                "pageType": "orderDetail",
+                "brandId": AMAZON_NOW_BRAND_ID,
+            },
+            timeout=15_000,
+        )
+    except Exception as exc:
+        print(f"[order][now] getOrderDetails request failed: {exc}")
+        return []
+    if resp.status != 200:
+        print(f"[order][now] getOrderDetails → HTTP {resp.status}; not an Amazon Now order.")
+        return []
+    try:
+        payload = await resp.json()
+    except Exception as exc:
+        print(f"[order][now] getOrderDetails returned non-JSON: {exc}")
+        return []
+
+    items = (
+        (payload.get("data") or {})
+        .get("orderDetailsResponse", {})
+        .get("orderItems")
+    ) or []
+
+    out: list[dict] = []
+    for it in items:
+        title = (it.get("title") or "").strip()
+        asin = (it.get("asin") or "").strip()
+        if not title or not asin:
+            continue
+        qty = it.get("quantity") or it.get("orderedQuantity") or 1
+        # totalOfferPrice is the line total at the price paid; divide by qty for
+        # a per-unit price. Fall back to buyingPrice then listPrice.
+        price = None
+        for field in ("totalOfferPrice", "buyingPrice", "listPrice"):
+            amount = (it.get(field) or {}).get("amount")
+            if amount is not None:
+                try:
+                    price = round(float(amount) / max(int(qty), 1), 2)
+                except (TypeError, ValueError):
+                    price = float(amount)
+                break
+        out.append({
+            "title": title,
+            "href": f"{AMAZON_HOME}/dp/{asin}",
+            "price": price,
+        })
+    if out:
+        print(f"[order][now] Amazon Now order — {len(out)} item(s) via getOrderDetails API.")
+    return out
+
+
+async def _dump_order_detail_diagnostics(page, idx: int) -> None:
+    """Called when an order-details page yields zero items. Logs DOM signals and
+    saves a screenshot + HTML so we can see why the extractor came up empty
+    (the page layout for that order differs from the ones that parse cleanly)."""
+    try:
+        signals = await page.evaluate(r"""
+            () => {
+              const q = (sel) => document.querySelectorAll(sel).length;
+              const section = document.querySelector('#ufpo-od-item-list-section');
+              const toggle = Array.from(document.querySelectorAll('a, button, span'))
+                .map(e => (e.textContent || '').replace(/\s+/g, ' ').trim())
+                .filter(t => /view\s+all\s+items?/i.test(t));
+              const itemsLabel = Array.from(document.querySelectorAll('*'))
+                .map(e => (e.textContent || '').trim())
+                .find(t => /\d+\s+items?\s+in\s+this\s+order/i.test(t)) || null;
+              return {
+                ufpo_section_present: !!section,
+                ufpo_grid_rows: section ? section.querySelectorAll("div[id$='-item-grid-row']").length : 0,
+                anchors_gp_product: q("a.a-link-normal[href*='/gp/product/']"),
+                anchors_dp: q("a.a-link-normal[href*='/dp/']"),
+                view_all_items_matches: toggle.slice(0, 3),
+                items_in_order_label: itemsLabel,
+                body_chars: (document.body.innerText || '').length,
+              };
+            }
+        """)
+    except Exception as exc:
+        signals = {"evaluate_error": str(exc)}
+
+    try:
+        title = await page.title()
+    except Exception:
+        title = "?"
+
+    print(
+        f"[order {idx}][diag] empty extraction — url={page.url}\n"
+        f"[order {idx}][diag] title={title!r}\n"
+        f"[order {idx}][diag] signals={json.dumps(signals, ensure_ascii=False)}"
+    )
+
+    shot = Path(f"amazon_order_{idx}_debug.png")
+    html = Path(f"amazon_order_{idx}_debug.html")
+    try:
+        await page.screenshot(path=str(shot), full_page=True)
+        html.write_text(await page.content(), encoding="utf-8")
+        print(f"[order {idx}][diag] saved {shot.name} and {html.name} for inspection.")
+    except Exception as exc:
+        print(f"[order {idx}][diag] could not save debug artifacts: {exc}")
+
+
 def _clean_amazon_product_title(raw: str) -> str:
     """Amazon titles are usually clean already, but they can include a trailing
     quantity badge or an ellipsis. Collapse whitespace and strip trailing junk."""
@@ -1352,11 +1483,30 @@ async def run(num_orders: int, headless: bool) -> None:
                 order_date = await _extract_order_date_from_detail_page(
                     page, order["fallback_date"]
                 )
-                await _expand_view_all_items(page)
-                items = await _extract_products_from_detail_page(page)
+                order_id = _extract_order_id(order["url"])
+
+                # Amazon Now orders redirect the classic order-details link into
+                # the /tez/ SPA (which often errors). Detect that and pull items
+                # from the Now JSON API instead of scraping the broken DOM. The
+                # origin also drives source__c in Salesforce ("Amazon Now" vs
+                # "Amazon Fresh").
+                order_source = "Amazon Fresh"
+                if "/tez/" in (page.url or ""):
+                    items = await _fetch_amazon_now_items(page, order_id)
+                    order_source = "Amazon Now"
+                else:
+                    await _expand_view_all_items(page)
+                    items = await _extract_products_from_detail_page(page)
+                    # Safety net: some Now orders don't visibly redirect but
+                    # still have no classic DOM — try the Now API before giving up.
+                    if not items:
+                        items = await _fetch_amazon_now_items(page, order_id)
+                        if items:
+                            order_source = "Amazon Now"
 
                 if not items:
                     print(f"[order {idx}/{actual_count}] No items found on detail page.")
+                    await _dump_order_detail_diagnostics(page, idx)
                     continue
 
                 seen_titles: set[str] = set()
@@ -1372,6 +1522,7 @@ async def run(num_orders: int, headless: bool) -> None:
                         "category": "Grocery",
                         "product_url_from_order": it.get("href"),
                         "purchased_price": it.get("price"),
+                        "source": order_source,
                     })
                 print(f"[order {idx}/{actual_count}] {len(seen_titles)} product(s)")
             except Exception as exc:
@@ -1389,12 +1540,15 @@ async def run(num_orders: int, headless: bool) -> None:
                 entry["last_purchased_price"] = p.get("purchased_price")
                 unique_by_title[t] = entry
                 continue
-            # Newer date wins — and the last purchased price tracks that order.
+            # Newer date wins — last purchased price and source track that order
+            # (a title bought via both services reflects the most recent one).
             if p.get("date") and p["date"] != "unknown" and (
                 not cur.get("date") or cur["date"] == "unknown" or p["date"] > cur["date"]
             ):
                 cur["date"] = p["date"]
                 cur["last_purchased_price"] = p.get("purchased_price")
+                if p.get("source"):
+                    cur["source"] = p["source"]
             # Backfill a missing price even when the date isn't newer.
             elif cur.get("last_purchased_price") is None and p.get("purchased_price") is not None:
                 cur["last_purchased_price"] = p.get("purchased_price")
@@ -1440,7 +1594,7 @@ async def run(num_orders: int, headless: bool) -> None:
                 "image_url": details["image_url"],
                 "category": entry.get("category", "Grocery"),
                 "availability": details["availability"] or "Unavailable",
-                "source": "Amazon",
+                "source": entry.get("source") or "Amazon Fresh",
                 "scraped_at": scraped_at,
             }
 

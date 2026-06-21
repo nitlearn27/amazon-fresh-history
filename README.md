@@ -5,11 +5,11 @@ scrapes the last N **Amazon Fresh** orders, and syncs each unique product to
 Salesforce `Grocery_Product__c` records.
 
 - **Sibling project** to `purchase-history` (Flipkart). Both write to the same
-  Salesforce object; the `source__c` field distinguishes the two
-  (`"Flipkart"` vs `"Amazon"`).
-- **Salesforce sync is update-only** — existing `Grocery_Product__c` records are
-  matched by `title__c` and have product fields patched. New records are
-  **never** created.
+  Salesforce object; the `source__c` field distinguishes the source
+  (`"Flipkart"`, `"Amazon Fresh"`, or `"Amazon Now"`).
+- **Salesforce sync upserts** by `title__c` (external ID): existing
+  `Grocery_Product__c` records are updated, and titles not seen before are
+  created.
 - **Interactive Swagger UI** at `/docs`.
 - **Deployable to Render** out of the box (Docker, headless Chromium).
 
@@ -26,6 +26,8 @@ Salesforce `Grocery_Product__c` records.
 | `POST` | `/api/products`  | Start a scrape in a background thread. Body: `{"orders": <int>}` (default 10). |
 | `GET`  | `/api/cart`      | Result of the last add-to-cart run (`added` vs `not_found`).               |
 | `POST` | `/api/cart`      | Add Amazon Fresh products to the cart by name. Body: `{"products": ["name", …]}`. |
+| `GET`  | `/api/otp`       | Is a run waiting for a 2-step OTP? `{waiting, waiting_since, ttl_seconds}`. |
+| `POST` | `/api/otp`       | Hand the 2-step verification OTP to a waiting run. Body: `{"otp": "123456"}`. |
 
 A scrape typically takes 3–8 minutes. Poll `GET /api/products` until `status`
 flips from `running` to results. A scrape and a cart run cannot overlap (they
@@ -72,12 +74,22 @@ logs the session out (usually days).
 
 ### OTP / 2-step verification
 
-When a login *is* needed, Amazon may ask for a 2-step verification code. The
-scraper polls `Purchase_Info__c.my_amazon_otp__c` in Salesforce every 5 s for up
-to 3 minutes — paste the OTP Amazon sent into that field and save; the scraper
-picks it up automatically, submits it, and immediately blanks the field.
+When a login *is* needed, Amazon may ask for a 2-step verification code. The run
+blocks for up to 3 minutes waiting for you to push the code over HTTP:
 
-This works the same way in headed local runs and headless Render runs.
+```bash
+# Check whether a run is waiting:
+curl $BASE_URL/api/otp        # → {"waiting": true, ...}
+
+# Hand it the OTP Amazon just sent:
+curl -X POST $BASE_URL/api/otp -H "Content-Type: application/json" -d '{"otp":"123456"}'
+```
+
+The scraper picks it up within ~1 s, submits it, and continues. The code is held
+in memory only and expires after `OTP_TTL_SECONDS` (default 300 s), so a stale
+code is never reused. This works the same way in headed local runs and headless
+Render runs. In a headed local browser you can also just type the OTP into Amazon
+directly — the run detects the screen advancing and carries on.
 
 ### Delivery location (Fresh availability)
 
@@ -102,8 +114,7 @@ If you want sync, create a Connected App with:
 - **OAuth flow:** Client Credentials
 - **Scopes:** `api`, `refresh_token`
 - **Run-as user** with read/update access to `Grocery_Product__c` (including the
-  `last_purchased_price__c` field) and read/edit on `Purchase_Info__c.my_amazon_otp__c`
-  for the OTP bridge.
+  `last_purchased_price__c` field).
 
 Then fill the four `SF_*` env vars in `.env`. If any are missing, sync is
 silently skipped and the scrape still completes.
@@ -197,18 +208,21 @@ flow. `render.yaml` declares every env var the service expects.
    | `DELIVERY_PINCODE`        | _(personal)_ 6-digit pincode fallback; set in dashboard, not in repo |
    | `AMAZON_AUTH_STATE_PATH`  | _(optional)_ session-cache file path; default `auth_state.json`  |
    | `AMAZON_SESSION_REUSE`    | _(optional)_ `true` enables session reuse; default `false` (off; `render.yaml` pins it off) |
+   | `OTP_TTL_SECONDS`         | _(optional)_ how long a pushed OTP stays valid; default `300` (5 min) |
 
    Only `AMAZON_*` are strictly required to deploy. The `SF_*` block enables
-   Salesforce sync + the OTP bridge; the rest have working defaults.
+   Salesforce sync; the rest have working defaults.
 
 4. **Deploy.** Trigger a scrape via `POST /api/products`.
 
 ### OTP on Render
 
 Each scrape does a full login. If Amazon asks for a 2-step verification code,
-watch the Render logs for the `[auth] ACTION REQUIRED` line, then paste the
-OTP into `Purchase_Info__c.my_amazon_otp__c` in Salesforce. The scraper picks
-it up within 5 seconds, submits it, and continues automatically.
+watch the Render logs for the `[auth] ACTION REQUIRED` line (or poll
+`GET /api/otp` for `waiting: true`), then `POST /api/otp` with `{"otp":"123456"}`.
+The scraper picks it up within ~1 second, submits it, and continues
+automatically. The code lives only in the running container's memory and expires
+after `OTP_TTL_SECONDS`.
 
 ---
 
@@ -231,7 +245,7 @@ it up within 5 seconds, submits it, and continues automatically.
       "image_url": "https://m.media-amazon.com/images/I/...",
       "category": "Grocery",
       "availability": "Available",
-      "source": "Amazon",
+      "source": "Amazon Fresh",
       "scraped_at": "2026-05-26T10:15:00+05:30"
     }
   ]

@@ -16,6 +16,7 @@ Endpoints:
 import asyncio
 import json
 import os
+import re
 import sys
 import threading
 from datetime import datetime, timezone
@@ -306,6 +307,55 @@ def api_add_to_cart():
     }), 202
 
 
+@app.route("/api/otp", methods=["GET"])
+def api_otp_status():
+    """
+    Report whether the scraper is currently blocked waiting for a 2-step
+    verification OTP, and how long a pushed code stays valid.
+
+    Response (200):
+      { "waiting": true, "waiting_since": "...", "ttl_seconds": 300 }
+    """
+    from otp_store import store as otp_store
+    return jsonify(otp_store.status()), 200
+
+
+@app.route("/api/otp", methods=["POST"])
+def api_submit_otp():
+    """
+    Hand a 2-step verification OTP to a scrape/cart run that is waiting for one.
+
+    JSON body: { "otp": "123456" }   (4–8 digits)
+
+    The code is held in memory only, consumed within ~1s by the waiting run, and
+    expires after OTP_TTL_SECONDS (default 300s). Returns 409 if nothing is
+    currently waiting for an OTP — check GET /api/otp first.
+    """
+    from otp_store import store as otp_store
+
+    if not otp_store.is_waiting():
+        return jsonify({
+            "status": "no_otp_requested",
+            "message": "No run is waiting for an OTP right now. Check GET /api/otp.",
+        }), 409
+
+    body = request.get_json(silent=True) or {}
+    code = str(body.get("otp", "")).strip()
+    if not re.fullmatch(r"\d{4,8}", code):
+        print(f"[otp] POST /api/otp rejected: {len(code)}-char value is not 4-8 digits.")
+        return jsonify({
+            "status": "invalid_request",
+            "message": 'Body must be {"otp": "<4-8 digits>"}.',
+        }), 400
+
+    otp_store.submit(code)
+    print(f"[otp] POST /api/otp accepted: {len(code)}-digit code stored for the waiting run.")
+    return jsonify({
+        "status": "accepted",
+        "message": "OTP received. The waiting run will pick it up within ~1 second.",
+    }), 200
+
+
 # ---------------------------------------------------------------------------
 # OpenAPI 3.0 spec + Swagger UI served at /docs
 # ---------------------------------------------------------------------------
@@ -320,10 +370,11 @@ _OPENAPI_SPEC = {
             "After every successful scrape, the scraper drills into each unique product's "
             "Amazon page to capture current price, image, URL and availability (a product "
             "page that shows a price counts as available), and carries the last purchased "
-            "price from the order history, then **updates** matching `Grocery_Product__c` "
-            "records using `title__c` as the match field — existing records are updated; "
-            "non-matching titles are skipped (no new records are ever created). Each row is "
-            "stamped with `source__c=\"Amazon\"`.\n\n"
+            "price from the order history, then **upserts** `Grocery_Product__c` "
+            "records using `title__c` as the external ID — existing titles are updated and "
+            "new titles are created. Each row is stamped with `source__c` = `\"Amazon Now\"` "
+            "(items from Amazon Now, the /tez/ quick-commerce service) or `\"Amazon Fresh\"` "
+            "(classic Amazon Fresh items).\n\n"
             "A scrape runs in a background thread and typically takes 3–8 minutes. "
             "Poll `GET /api/products` until the status flips from `running` to `ok`."
         ),
@@ -333,6 +384,7 @@ _OPENAPI_SPEC = {
         {"name": "scrape",   "description": "Trigger Amazon Fresh scrapes."},
         {"name": "products", "description": "Read the latest scrape output."},
         {"name": "cart",     "description": "Add Amazon Fresh products to the cart by name."},
+        {"name": "auth",     "description": "Hand the 2-step verification OTP to a waiting run."},
     ],
     "paths": {
         "/health": {
@@ -492,6 +544,65 @@ _OPENAPI_SPEC = {
                 },
             },
         },
+        "/api/otp": {
+            "get": {
+                "tags": ["auth"],
+                "summary": "Is a run waiting for an OTP?",
+                "description": (
+                    "Reports whether a scrape/cart run is currently blocked on Amazon's "
+                    "2-step verification screen, and how long a pushed code stays valid."
+                ),
+                "responses": {
+                    "200": {
+                        "description": "OTP wait status.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/OtpStatus"},
+                            "example": {
+                                "waiting": True,
+                                "waiting_since": "2026-06-21T10:15:00+00:00",
+                                "ttl_seconds": 300,
+                            },
+                        }},
+                    },
+                },
+            },
+            "post": {
+                "tags": ["auth"],
+                "summary": "Submit the 2-step verification OTP",
+                "description": (
+                    "Hands the OTP Amazon just emailed/SMS'd to a run that is waiting for it. "
+                    "The code is held in memory only, consumed within ~1s, and expires after "
+                    "`OTP_TTL_SECONDS` (default 300). Returns `409` if nothing is waiting."
+                ),
+                "requestBody": {
+                    "required": True,
+                    "content": {"application/json": {
+                        "schema": {"$ref": "#/components/schemas/OtpRequest"},
+                        "example": {"otp": "123456"},
+                    }},
+                },
+                "responses": {
+                    "200": {
+                        "description": "OTP accepted.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/OtpAccepted"},
+                        }},
+                    },
+                    "400": {
+                        "description": "Missing or malformed OTP.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"},
+                        }},
+                    },
+                    "409": {
+                        "description": "No run is waiting for an OTP.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"},
+                        }},
+                    },
+                },
+            },
+        },
     },
     "components": {
         "schemas": {
@@ -500,6 +611,30 @@ _OPENAPI_SPEC = {
                 "properties": {
                     "status":    {"type": "string", "example": "ok"},
                     "timestamp": {"type": "string", "format": "date-time"},
+                },
+            },
+            "OtpStatus": {
+                "type": "object",
+                "properties": {
+                    "waiting":       {"type": "boolean", "example": True},
+                    "waiting_since": {"type": "string", "format": "date-time", "nullable": True},
+                    "ttl_seconds":   {"type": "integer", "example": 300,
+                                      "description": "How long a pushed OTP stays valid."},
+                },
+            },
+            "OtpRequest": {
+                "type": "object",
+                "required": ["otp"],
+                "properties": {
+                    "otp": {"type": "string", "example": "123456",
+                            "description": "The 4–8 digit code Amazon emailed/SMS'd."},
+                },
+            },
+            "OtpAccepted": {
+                "type": "object",
+                "properties": {
+                    "status":  {"type": "string", "example": "accepted"},
+                    "message": {"type": "string"},
                 },
             },
             "ScrapeRequest": {
@@ -570,7 +705,8 @@ _OPENAPI_SPEC = {
                     "image_url":                 {"type": "string", "nullable": True, "example": "https://m.media-amazon.com/images/..."},
                     "category":                  {"type": "string", "nullable": True, "example": "Grocery"},
                     "availability":              {"type": "string", "nullable": True, "example": "Available"},
-                    "source":                    {"type": "string", "nullable": True, "example": "Amazon"},
+                    "source":                    {"type": "string", "nullable": True, "example": "Amazon Fresh",
+                                                  "description": "\"Amazon Now\" or \"Amazon Fresh\", per product origin."},
                     "scraped_at":                {"type": "string", "format": "date-time", "nullable": True},
                 },
             },
