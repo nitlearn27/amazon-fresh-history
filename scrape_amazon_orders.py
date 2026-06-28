@@ -276,6 +276,20 @@ async def is_logged_in(page) -> bool:
     if "/ap/signin" in url or "/ap/login" in url:
         print(f"[auth] is_logged_in=False — URL is on signin page ({page.url})")
         return False
+
+    # If the URL already indicates we are on orders or account page, we are logged in
+    if "/your-orders/" in url or "/your-account" in url:
+        print(f"[auth] is_logged_in=True — URL indicates we are logged in ({page.url})")
+        return True
+
+    try:
+        title = ((await page.title()) or "").lower()
+        if "your orders" in title or "your account" in title:
+            print(f"[auth] is_logged_in=True — Page title indicates we are logged in ({page.url})")
+            return True
+    except Exception:
+        pass
+
     try:
         await page.wait_for_selector(SELECTORS["logged_in_indicator"], timeout=4_000)
         print(f"[auth] is_logged_in=True — account nav element present at {page.url}")
