@@ -59,11 +59,19 @@ _cart_state = {
     "error": None,
 }
 
+# Search state
+_search_state = {
+    "running": False,
+    "last_result": None,          # list of scraped products
+    "last_run_at": None,
+    "error": None,
+}
+
 
 def _account_busy() -> bool:
-    """True if a scrape or a cart run is in flight. Both launch their own
+    """True if a scrape, a cart run, or a search is in flight. All launch their own
     Chromium against the single Amazon account, so they must not overlap."""
-    return _state["running"] or _cart_state["running"]
+    return _state["running"] or _cart_state["running"] or _search_state["running"]
 
 
 def _headless() -> bool:
@@ -356,6 +364,49 @@ def api_submit_otp():
     }), 200
 
 
+@app.route("/api/search", methods=["GET"])
+def api_search():
+    """
+    Search Amazon Fresh/Now for a query and return scraped products.
+    Query param: q (string, required)
+    """
+    query = request.args.get("q", "").strip()
+    if not query:
+        return jsonify({
+            "status": "invalid_request",
+            "message": "Query parameter 'q' is required.",
+        }), 400
+
+    with _lock:
+        if _account_busy():
+            return jsonify({
+                "status": "running",
+                "message": "A scrape, cart run, or search is already in progress.",
+            }), 409
+        _search_state["running"] = True
+        _search_state["error"] = None
+
+    try:
+        from amazon_search import search_amazon_now
+        products = asyncio.run(search_amazon_now(query, headless=_headless()))
+        _search_state["last_result"] = products
+        _search_state["error"] = None
+        _search_state["last_run_at"] = datetime.now(tz=timezone.utc).isoformat()
+        return jsonify({
+            "products": products
+        }), 200
+    except BaseException as exc:
+        err_msg = str(exc) or exc.__class__.__name__
+        _search_state["error"] = err_msg
+        _search_state["last_run_at"] = datetime.now(tz=timezone.utc).isoformat()
+        return jsonify({
+            "status": "error",
+            "error": err_msg
+        }), 500
+    finally:
+        _search_state["running"] = False
+
+
 # ---------------------------------------------------------------------------
 # OpenAPI 3.0 spec + Swagger UI served at /docs
 # ---------------------------------------------------------------------------
@@ -384,6 +435,7 @@ _OPENAPI_SPEC = {
         {"name": "scrape",   "description": "Trigger Amazon Fresh scrapes."},
         {"name": "products", "description": "Read the latest scrape output."},
         {"name": "cart",     "description": "Add Amazon Fresh products to the cart by name."},
+        {"name": "search",   "description": "Search Amazon Fresh/Now catalog."},
         {"name": "auth",     "description": "Hand the 2-step verification OTP to a waiting run."},
     ],
     "paths": {
@@ -467,6 +519,48 @@ _OPENAPI_SPEC = {
                     },
                 },
             },
+        },
+        "/api/search": {
+            "get": {
+                "tags": ["search"],
+                "summary": "Search Amazon Fresh/Now catalog",
+                "description": "Performs a live search for a product on Amazon Fresh/Now and returns details.",
+                "parameters": [
+                    {
+                        "name": "q",
+                        "in": "query",
+                        "description": "The product search query",
+                        "required": True,
+                        "schema": {"type": "string"}
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Search completed successfully.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/SearchResponse"}
+                        }}
+                    },
+                    "400": {
+                        "description": "Missing query parameter.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"}
+                        }}
+                    },
+                    "409": {
+                        "description": "A scrape, cart run, or search is already in progress.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"}
+                        }}
+                    },
+                    "500": {
+                        "description": "Search failed or errored.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"}
+                        }}
+                    }
+                }
+            }
         },
         "/api/cart": {
             "get": {
@@ -764,6 +858,29 @@ _OPENAPI_SPEC = {
                                    "description": "Total items in the cart after the run (nav badge)."},
                     "added_at":   {"type": "string", "format": "date-time"},
                 },
+            },
+            "SearchResponse": {
+                "type": "object",
+                "properties": {
+                    "products": {
+                        "type": "array",
+                        "items": {"$ref": "#/components/schemas/ScrapedProduct"}
+                    }
+                }
+            },
+            "ScrapedProduct": {
+                "type": "object",
+                "properties": {
+                    "availability": {"type": "string", "example": "Available"},
+                    "current_price": {"type": "number", "nullable": True, "example": 35},
+                    "image_url": {"type": "string", "nullable": True, "example": "https://..."},
+                    "product_name": {"type": "string", "example": "Amul Gold Full Cream Milk 500 ml"},
+                    "product_url": {"type": "string", "nullable": True, "example": "https://..."},
+                    "rating": {"type": "number", "nullable": True, "example": 4.3},
+                    "scraped_at": {"type": "string", "format": "date-time", "example": "2026-06-28T18:02:18.457Z"},
+                    "source": {"type": "string", "example": "Amazon now"},
+                    "weight": {"type": "string", "nullable": True, "example": "500 gm"}
+                }
             },
         }
     },

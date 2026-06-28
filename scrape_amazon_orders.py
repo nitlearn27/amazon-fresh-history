@@ -38,6 +38,7 @@ SELECTORS = {
         "input#auth-mfa-otpcode, input[name='otpCode'], "
         "input#input-box-otp, input[name='code']"
     ),
+    "otp_remember_device": "input[name='rememberDevice'], input[name='rememberMe'], input[type='checkbox']",
     "otp_submit": (
         "input#auth-signin-button, input[aria-labelledby*='auth-signin-button'], "
         "input#cvf-submit-otp-button"
@@ -46,7 +47,8 @@ SELECTORS = {
     # / "Continue" button that must be clicked before the code-entry field renders.
     "otp_send_button": (
         "input#auth-send-code, input#cvf-submit-otp-button, "
-        "input[aria-labelledby*='cvf-submit-otp-button'], input#auth-get-new-otp"
+        "input[aria-labelledby*='cvf-submit-otp-button'], input#auth-get-new-otp, "
+        "input[value*='Send OTP' i], input[type='submit'][value*='OTP' i]"
     ),
     # Logged-in marker on amazon.in
     "logged_in_indicator": "#nav-link-accountList, a[href*='/your-account']",
@@ -461,6 +463,23 @@ async def _handle_otp_challenge(page) -> bool:
 
     await otp_input.fill(otp)
     print(f"[auth] OTP filled into Amazon ({len(otp)} digits). Submitting…")
+
+    # Try to check "Don't ask for codes on this device" if present
+    try:
+        checkbox = page.locator(SELECTORS["otp_remember_device"]).first
+        if await checkbox.count() > 0 and await checkbox.is_visible():
+            if not await checkbox.is_checked():
+                await checkbox.check(timeout=3000)
+                print("[auth] Checked 'Don't ask for codes on this device' checkbox.")
+        else:
+            # Fallback: click by label text
+            label = page.get_by_text("Don't ask for codes on this device").first
+            if await label.count() > 0 and await label.is_visible():
+                await label.click(timeout=3000)
+                print("[auth] Clicked 'Don't ask for codes on this device' label text.")
+    except Exception as exc:
+        print(f"[auth] Could not check 'Don't ask for codes on this device' checkbox: {exc}")
+
     submit = page.locator(SELECTORS["otp_submit"]).first
     try:
         await submit.wait_for(state="visible", timeout=5_000)
@@ -540,33 +559,39 @@ async def login(page, amazon_username: str, amazon_password: str, headless: bool
 
     # Step 1: email/phone
     email_input = page.locator(SELECTORS["email_input"]).first
-    try:
-        await email_input.wait_for(state="visible", timeout=10_000)
-    except PlaywrightTimeoutError:
-        screenshot_path = Path("amazon_login_debug.png")
-        await page.screenshot(path=str(screenshot_path), full_page=True)
-        print(
-            f"[error] Could not locate Amazon email input.\n"
-            f"  URL        : {page.url}\n"
-            f"  Screenshot : {screenshot_path.resolve()}"
-        )
-        sys.exit(1)
+    password_input = page.locator(SELECTORS["password_input"]).first
 
-    await email_input.fill(amazon_username)
-    print("[auth] Email/phone entered.")
+    # Check if we are already on the password screen (e.g. account preselected)
+    if await password_input.count() > 0 and await password_input.is_visible():
+        print("[auth] Password input is already visible; skipping email entry.")
+    else:
+        try:
+            await email_input.wait_for(state="visible", timeout=10_000)
+        except PlaywrightTimeoutError:
+            screenshot_path = Path("amazon_login_debug.png")
+            await page.screenshot(path=str(screenshot_path), full_page=True)
+            print(
+                f"[error] Could not locate Amazon email input.\n"
+                f"  URL        : {page.url}\n"
+                f"  Screenshot : {screenshot_path.resolve()}"
+            )
+            sys.exit(1)
 
-    continue_btn = page.locator(SELECTORS["continue_button"]).first
-    try:
-        await continue_btn.wait_for(state="visible", timeout=5_000)
-        await continue_btn.click()
-        print("[auth] Clicked Continue.")
-    except PlaywrightTimeoutError:
-        await email_input.press("Enter")
-        print("[auth] Continue button not visible — pressed Enter on email field.")
-    await page.wait_for_timeout(2_000)
-    await _log_page_state(page, "after Continue")
+        await email_input.fill(amazon_username)
+        print("[auth] Email/phone entered.")
 
-    await _handle_captcha_block(page)
+        continue_btn = page.locator(SELECTORS["continue_button"]).first
+        try:
+            await continue_btn.wait_for(state="visible", timeout=5_000)
+            await continue_btn.click()
+            print("[auth] Clicked Continue.")
+        except PlaywrightTimeoutError:
+            await email_input.press("Enter")
+            print("[auth] Continue button not visible — pressed Enter on email field.")
+        await page.wait_for_timeout(2_000)
+        await _log_page_state(page, "after Continue")
+
+        await _handle_captcha_block(page)
 
     # Step 2: password
     password_input = page.locator(SELECTORS["password_input"]).first
@@ -1351,6 +1376,16 @@ async def open_logged_in_page(pw, headless: bool):
 
     # ---- Reuse a saved session if one exists (skips login + OTP) ----
     state_path = auth_state_path()
+
+    # Reconstruct state file from env var if missing (e.g. on ephemeral cloud container spinup)
+    raw_state = (os.getenv("AMAZON_AUTH_STATE") or "").strip()
+    if raw_state and not state_path.exists():
+        try:
+            state_path.write_text(raw_state, encoding="utf-8")
+            print(f"[auth] Recreated {state_path} from AMAZON_AUTH_STATE environment variable.")
+        except Exception as exc:
+            print(f"[auth] Warning: could not write session to {state_path} from env variable: {exc}")
+
     reuse = session_reuse_enabled() and state_path.exists()
     base_kwargs = {"viewport": {"width": 1280, "height": 800}}
     if reuse:
@@ -1410,6 +1445,11 @@ async def open_logged_in_page(pw, headless: bool):
     try:
         await context.storage_state(path=str(state_path))
         print(f"[auth] Session saved to {state_path}.")
+        if state_path.exists():
+            state_content = state_path.read_text(encoding="utf-8")
+            print(f"\n[auth] AMAZON_AUTH_STATE (copy the raw JSON below for cloud deployment):")
+            print(state_content)
+            print("[auth] END AMAZON_AUTH_STATE\n")
     except Exception as exc:
         # Login already succeeded — a save failure is non-fatal.
         print(f"[auth] Warning: could not save session to {state_path}: {exc}")
