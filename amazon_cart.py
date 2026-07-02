@@ -53,6 +53,10 @@ CART_SELECTORS = {
         "button[data-csa-c-content-id='AsinFaceout-AddToCartQtyStepper-{asin}']"
         "[aria-label*='Increase' i]"
     ),
+    # Products with size variants render "N options | Add" instead of a plain
+    # Add button; clicking it opens a bottom sheet with one Add per variant.
+    "now_add_variation": "[data-csa-c-content-id='AsinFaceout-AddToCartWithVariation-{asin}']",
+    "now_variant_add": "button[data-csa-c-content-id='AsinVariationsBottomBanner-AddToCart-{asin}']",
 }
 
 # Amazon Fresh / "Now" store node. Restricting the search to this node keeps
@@ -301,32 +305,93 @@ async def _scan_now_results(page, name: str) -> list[dict]:
             continue
         if (p.get("availability") or {}).get("type") != "IN_STOCK":
             continue
+        variations = {}
+        for va, v in (p.get("variations") or {}).items():
+            if (v.get("availability") or {}).get("type") != "IN_STOCK":
+                continue
+            variations[va] = {
+                "pack_size": v.get("packSize") or "",
+                "price": (v.get("buyingPrice") or {}).get("amount"),
+            }
         candidates.append({
             "asin": asin,
             "title": title,
             "price": (p.get("buyingPrice") or {}).get("amount"),
+            "variations": variations,
         })
         if len(candidates) >= MAX_RESULTS_TO_SCAN:
             break
     return candidates
 
 
-async def _click_now_add_for_asin(page, asin: str) -> bool:
-    """Click the Amazon Now Add button for `asin` — or, when the item is
-    already in the Now cart, the quantity stepper's "+" (both add one unit).
-    Returns True if the click landed and the SPA acknowledged it (cart XHR or
-    the button turning into a quantity stepper)."""
-    btn = page.locator(CART_SELECTORS["now_add_button"].format(asin=asin)).first
+def _pick_size_variant(query: str, variations: dict) -> str | None:
+    """Variant ASIN whose pack size (e.g. "5 kg") is named in the query, if
+    any. Comparison ignores whitespace and case ("Toor 5kg" matches "5 kg")."""
+    nq = re.sub(r"\s+", "", query.lower())
+    for vasin, v in variations.items():
+        ps = re.sub(r"\s+", "", (v.get("pack_size") or "").lower())
+        if ps and ps in nq:
+            return vasin
+    return None
+
+
+async def _visible(locator) -> bool:
     try:
-        await btn.wait_for(state="visible", timeout=10_000)
+        return await locator.count() > 0 and await locator.is_visible()
     except Exception:
-        btn = page.locator(CART_SELECTORS["now_qty_increase"].format(asin=asin)).first
-        try:
-            await btn.wait_for(state="visible", timeout=3_000)
+        return False
+
+
+async def _click_now_add_for_asin(page, asin: str, variant_asin: str | None = None) -> bool:
+    """Click the Amazon Now Add control for `asin` and return True if the SPA
+    acknowledged the add (cart XHR, or the button turning into a stepper).
+
+    Handles the three card variants:
+    - plain Add button;
+    - quantity stepper "+" when the item is already in the Now cart;
+    - "N options | Add" for size-variant products — opens the bottom sheet and
+      clicks the Add for `variant_asin` (a size named in the query) or for
+      `asin` itself (the card's displayed default, e.g. 1 kg)."""
+    add_btn = page.locator(CART_SELECTORS["now_add_button"].format(asin=asin)).first
+    stepper = page.locator(CART_SELECTORS["now_qty_increase"].format(asin=asin)).first
+    variation = page.locator(CART_SELECTORS["now_add_variation"].format(asin=asin)).first
+
+    btn = None
+    for _ in range(20):
+        if await _visible(add_btn):
+            btn = add_btn
+            break
+        if await _visible(stepper):
             print(f"[cart] {asin} is already in the Now cart — adding one more unit.")
-        except Exception:
-            print(f"[cart] No Amazon Now Add button or quantity stepper rendered for {asin}.")
+            btn = stepper
+            break
+        if await _visible(variation):
+            break
+        await page.wait_for_timeout(500)
+
+    if btn is None and await _visible(variation):
+        print(f"[cart] {asin} has size options — opening the variant sheet.")
+        try:
+            await variation.scroll_into_view_if_needed(timeout=3_000)
+            await variation.click(timeout=5_000)
+        except Exception as exc:
+            print(f"[cart] Could not open the variant sheet for {asin}: {exc}")
             return False
+        for target in dict.fromkeys([variant_asin or asin, asin]):
+            vbtn = page.locator(CART_SELECTORS["now_variant_add"].format(asin=target)).first
+            try:
+                await vbtn.wait_for(state="visible", timeout=8_000)
+                btn = vbtn
+                break
+            except Exception:
+                continue
+        if btn is None:
+            print(f"[cart] Variant sheet opened but no Add button found for {asin}.")
+            return False
+
+    if btn is None:
+        print(f"[cart] No Amazon Now Add control rendered for {asin}.")
+        return False
     try:
         await btn.scroll_into_view_if_needed(timeout=3_000)
     except Exception:
@@ -394,7 +459,17 @@ async def add_one_now(page, name: str) -> dict:
     record["product_url"] = f"{AMAZON_HOME}/dp/{match['asin']}"
     print(f"[cart] Now match for {name!r}: {match['title'][:70]!r} @ {score:.2f}")
 
-    if await _click_now_add_for_asin(page, match["asin"]):
+    # If the query names a pack size that exists as a variant (e.g. "Toor 5kg"),
+    # prefer that variant; otherwise the card's default size is added.
+    variant_asin = _pick_size_variant(name, match.get("variations") or {})
+    if variant_asin:
+        variant = match["variations"][variant_asin]
+        record["asin"] = variant_asin
+        record["price"] = variant["price"]
+        record["product_url"] = f"{AMAZON_HOME}/dp/{variant_asin}"
+        print(f"[cart] Query names pack size {variant['pack_size']!r} — using variant {variant_asin}.")
+
+    if await _click_now_add_for_asin(page, match["asin"], variant_asin):
         record["added"] = True
         print(f"[cart] Added to the Amazon Now cart.")
     else:
