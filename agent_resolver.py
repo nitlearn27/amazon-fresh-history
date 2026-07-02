@@ -73,6 +73,12 @@ def _deepseek_chat(messages: list[dict]) -> dict | None:
     """One DeepSeek chat call; returns the parsed JSON object or None."""
     base = (os.getenv("DEEPSEEK_BASE_URL") or "https://api.deepseek.com").rstrip("/")
     model = (os.getenv("DEEPSEEK_MODEL") or "deepseek-chat").strip()
+
+    # Catchy log to easily identify when the DeepSeek API model is getting used
+    print("\n" + "🚀" * 40)
+    print(f"🔮 \033[1;35m[DEEPSEEK ACTIVE]\033[0m Calling DeepSeek API Model: \033[1;33;44m {model} \033[0m 🔮")
+    print("🚀" * 40 + "\n")
+
     try:
         resp = requests.post(
             f"{base}/chat/completions",
