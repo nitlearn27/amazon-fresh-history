@@ -289,17 +289,31 @@ def api_add_to_cart():
                 "message": "A scrape or cart run is already in progress.",
             }), 409
 
-        body = request.get_json(silent=True) or {}
-        products = body.get("products")
-        if (
-            not isinstance(products, list)
-            or not products
-            or not all(isinstance(p, str) and p.strip() for p in products)
-        ):
+        body = request.get_json(silent=True)
+        if body is None:
+            reason = (
+                "request body is not valid JSON (also check the Content-Type: "
+                "application/json header)"
+            )
+        elif not isinstance(body, dict) or "products" not in body:
+            reason = 'JSON body has no "products" key'
+        elif not isinstance(body["products"], list):
+            reason = f'"products" must be an array, got {type(body["products"]).__name__}'
+        elif not body["products"]:
+            reason = '"products" array is empty'
+        elif not all(isinstance(p, str) and p.strip() for p in body["products"]):
+            reason = 'every entry in "products" must be a non-empty string'
+        else:
+            reason = None
+        if reason:
             return jsonify({
                 "status": "invalid_request",
-                "message": 'Body must be {"products": ["name1", "name2", ...]} with at least one non-empty name.',
+                "message": (
+                    f'Invalid request: {reason}. Body must be '
+                    '{"products": ["name1", "name2", ...]} with at least one non-empty name.'
+                ),
             }), 400
+        products = body["products"]
 
         names = [p.strip() for p in products]
         _cart_state["running"] = True
