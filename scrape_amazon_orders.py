@@ -989,13 +989,24 @@ async def _collect_fresh_order_detail_urls(
     seen_urls: set[str] = set()
 
     for page_index in range(max_pages):
+        order_card_selector = SELECTORS["order_card"]
         try:
-            await page.wait_for_selector(SELECTORS["order_card"], timeout=10_000)
+            await page.wait_for_selector(order_card_selector, timeout=10_000)
         except PlaywrightTimeoutError:
-            print(f"[orders] No order cards on page {page_index + 1}; stopping.")
-            break
+            # Self-heal: the order-card selector may have gone stale.
+            from agent_resolver import resolve_selector
+            healed = await resolve_selector(
+                page, "scrape.order_card",
+                "exactly one element per order card on this Amazon order-history "
+                "page, each card containing an order date and an order total",
+                expectation=r"₹|Order", min_count=1,
+            )
+            if healed is None:
+                print(f"[orders] No order cards on page {page_index + 1}; stopping.")
+                break
+            order_card_selector = healed
 
-        cards = await page.query_selector_all(SELECTORS["order_card"])
+        cards = await page.query_selector_all(order_card_selector)
         print(f"[orders] Page {page_index + 1}: {len(cards)} order card(s) on screen.")
 
         for card in cards:

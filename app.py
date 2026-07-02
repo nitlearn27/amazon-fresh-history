@@ -421,6 +421,26 @@ def api_search():
         _search_state["running"] = False
 
 
+@app.route("/api/skills", methods=["GET"])
+def api_skills():
+    """Skills the self-healing agent has learned (see agent_skills.py)."""
+    from agent_skills import all_skills
+    from agent_resolver import agent_enabled
+    return jsonify({"agent_enabled": agent_enabled(), "skills": all_skills()}), 200
+
+
+@app.route("/api/skills/<skill_id>", methods=["DELETE"])
+def api_delete_skill(skill_id: str):
+    """Forget one learned skill (e.g. after Amazon changes its DOM again)."""
+    from agent_skills import delete_skill
+    if delete_skill(skill_id):
+        return jsonify({"status": "deleted", "id": skill_id}), 200
+    return jsonify({
+        "status": "not_found",
+        "message": f"No skill with id {skill_id!r}.",
+    }), 404
+
+
 # ---------------------------------------------------------------------------
 # OpenAPI 3.0 spec + Swagger UI served at /docs
 # ---------------------------------------------------------------------------
@@ -449,6 +469,7 @@ _OPENAPI_SPEC = {
         {"name": "scrape",   "description": "Trigger Amazon Fresh scrapes."},
         {"name": "products", "description": "Read the latest scrape output."},
         {"name": "cart",     "description": "Add products to the cart by name — Amazon Now first, Fresh fallback."},
+        {"name": "agent",    "description": "Self-healing agent (DeepSeek): learned recovery skills."},
         {"name": "search",   "description": "Search Amazon Fresh/Now catalog."},
         {"name": "auth",     "description": "Hand the 2-step verification OTP to a waiting run."},
     ],
@@ -660,6 +681,45 @@ _OPENAPI_SPEC = {
                 },
             },
         },
+        "/api/skills": {
+            "get": {
+                "tags": ["agent"],
+                "summary": "List skills the self-healing agent has learned",
+                "description": (
+                    "When an automation step fails (e.g. an Add button that is really a "
+                    "size-variant control), the agent asks DeepSeek to resolve it and, on "
+                    "success, persists the recipe as a skill replayed instantly next time. "
+                    "Skills are data (click steps / selector overrides), never code."
+                ),
+                "responses": {
+                    "200": {
+                        "description": "Learned skills with usage counts.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/SkillList"},
+                        }},
+                    },
+                },
+            },
+        },
+        "/api/skills/{skillId}": {
+            "delete": {
+                "tags": ["agent"],
+                "summary": "Forget one learned skill",
+                "parameters": [{
+                    "name": "skillId", "in": "path", "required": True,
+                    "schema": {"type": "string"},
+                }],
+                "responses": {
+                    "200": {"description": "Skill deleted."},
+                    "404": {
+                        "description": "No skill with that id.",
+                        "content": {"application/json": {
+                            "schema": {"$ref": "#/components/schemas/Error"},
+                        }},
+                    },
+                },
+            },
+        },
         "/api/otp": {
             "get": {
                 "tags": ["auth"],
@@ -859,6 +919,16 @@ _OPENAPI_SPEC = {
                     "asin":           {"type": "string", "nullable": True, "example": "B0..."},
                     "source":         {"type": "string", "enum": ["Amazon Now", "Amazon Fresh"],
                                        "description": "Which cart the item was added to."},
+                    "resolved_by":    {"type": "string", "nullable": True, "example": "skill:a1b2c3d4e5f6",
+                                       "description": "Present when the self-healing agent recovered a "
+                                                      "failed add: \"agent\" (DeepSeek) or \"skill:<id>\"."},
+                },
+            },
+            "SkillList": {
+                "type": "object",
+                "properties": {
+                    "agent_enabled": {"type": "boolean"},
+                    "skills": {"type": "array", "items": {"type": "object"}},
                 },
             },
             "NotFoundItem": {

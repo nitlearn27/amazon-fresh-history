@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 from scrape_amazon_orders import open_logged_in_page, AMAZON_NOW_BRAND_ID
+from agent_resolver import resolve_selector
 
 # Selectors specific to search results
 SEARCH_SELECTORS = {
@@ -91,17 +92,30 @@ async def _search_fresh_classic(page, query: str) -> list[dict]:
         pass
 
     # Wait for search results to load
+    card_selector = None
     try:
         await page.wait_for_selector(SEARCH_SELECTORS["result_card"], timeout=8000)
     except PlaywrightTimeoutError:
-        print(f"[search] No search results found for: {query}")
-        return []
+        # A genuinely empty search is not a failure — don't invoke the agent.
+        if await page.get_by_text("No results for", exact=False).count() > 0:
+            print(f"[search] No search results found for: {query}")
+            return []
+        # Self-heal: the card selector may have gone stale.
+        card_selector = await resolve_selector(
+            page, "search.result_card",
+            "exactly one element per product search-result card, each card "
+            "containing a product title and a ₹ price",
+            expectation="₹", min_count=2,
+        )
+        if card_selector is None:
+            print(f"[search] No search results found for: {query}")
+            return []
 
     # Extract products using a robust JS evaluation
     scraped_at = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     products = await page.evaluate(
         r"""
-        ({scrapedAt}) => {
+        ({scrapedAt, cardSelector}) => {
             const priceFromCard = (card) => {
                 const off = card.querySelector("span.a-price > span.a-offscreen, .a-price .a-offscreen");
                 const text = (off ? off.textContent : '') || '';
@@ -176,9 +190,7 @@ async def _search_fresh_classic(page, query: str) -> list[dict]:
                 return null;
             };
 
-            const cards = Array.from(
-                document.querySelectorAll("div[data-component-type='s-search-result'][data-asin]")
-            ).filter(c => (c.getAttribute('data-asin') || '').trim()).slice(0, 3);
+            const cards = Array.from(document.querySelectorAll(cardSelector)).slice(0, 3);
 
             return cards.map(card => {
                 const productName = titleFromCard(card);
@@ -210,6 +222,6 @@ async def _search_fresh_classic(page, query: str) -> list[dict]:
             });
         }
         """,
-        {"scrapedAt": scraped_at}
+        {"scrapedAt": scraped_at, "cardSelector": card_selector or SEARCH_SELECTORS["result_card"]}
     )
     return products or []

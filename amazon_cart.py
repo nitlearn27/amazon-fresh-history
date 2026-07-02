@@ -26,6 +26,7 @@ from urllib.parse import quote
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
 from scrape_amazon_orders import AMAZON_HOME, AMAZON_NOW_BRAND_ID, open_logged_in_page
+from agent_resolver import attempt_action_recovery, resolve_selector
 
 # ---------------------------------------------------------------------------
 # Selectors — update here when Amazon changes its markup. Mirrors the SELECTORS
@@ -166,9 +167,10 @@ async def _read_cart_count(page) -> int:
         return 0
 
 
-async def _scan_results(page) -> list[dict]:
+async def _scan_results(page, card_selector: str | None = None) -> list[dict]:
     """Collect up to MAX_RESULTS_TO_SCAN search-result cards as
-    {asin, title, price} dicts, in page order.
+    {asin, title, price} dicts, in page order. `card_selector` overrides the
+    default card selector (used when the agent has learned a replacement).
 
     Title extraction is deliberately tolerant: Amazon cards often carry a short
     brand byline `<h2>` (e.g. "Aashirvaad") above the real product title, so we
@@ -176,7 +178,7 @@ async def _scan_results(page) -> list[dict]:
     than trusting the first `h2`."""
     raw = await page.evaluate(
         r"""
-        (maxResults) => {
+        ({maxResults, cardSelector}) => {
           const priceFromCard = (card) => {
             const off = card.querySelector("span.a-price > span.a-offscreen, .a-price .a-offscreen");
             const text = (off ? off.textContent : '') || '';
@@ -209,15 +211,22 @@ async def _scan_results(page) -> list[dict]:
             const a = card.querySelector("a.a-link-normal[href*='/dp/'], a.a-link-normal[href*='/gp/product/']");
             return a ? a.href : null;
           };
-          const cards = Array.from(
-            document.querySelectorAll("div[data-component-type='s-search-result'][data-asin]")
-          ).filter(c => (c.getAttribute('data-asin') || '').trim());
+          const asinFromCard = (card) => {
+            const direct = (card.getAttribute('data-asin') || '').trim();
+            if (direct) return direct;
+            const href = hrefFromCard(card) || '';
+            const m = href.match(/\/(?:dp|gp\/product)\/([A-Z0-9]{10})/);
+            return m ? m[1] : '';
+          };
+          const cards = Array.from(document.querySelectorAll(cardSelector));
           const out = [];
           for (const card of cards) {
+            const asin = asinFromCard(card);
+            if (!asin) continue;
             const title = titleFromCard(card);
             if (!title || title.length < 3) continue;
             out.push({
-              asin: card.getAttribute('data-asin').trim(),
+              asin,
               title,
               price: priceFromCard(card),
               href: hrefFromCard(card),
@@ -227,7 +236,7 @@ async def _scan_results(page) -> list[dict]:
           return out;
         }
         """,
-        MAX_RESULTS_TO_SCAN,
+        {"maxResults": MAX_RESULTS_TO_SCAN, "cardSelector": card_selector or CART_SELECTORS["result_card"]},
     )
     return raw or []
 
@@ -472,6 +481,37 @@ async def add_one_now(page, name: str) -> dict:
     if await _click_now_add_for_asin(page, match["asin"], variant_asin):
         record["added"] = True
         print(f"[cart] Added to the Amazon Now cart.")
+        return record
+
+    # Self-heal: let the agent try learned skills / DeepSeek before giving up.
+    async def _confirm() -> bool:
+        # A successful add renders a quantity stepper for the ASIN; poll a few
+        # seconds since the SPA confirms asynchronously.
+        for _ in range(10):
+            for a in {match["asin"], variant_asin or match["asin"]}:
+                if await _visible(page.locator(f"[data-csa-c-content-id*='QtyStepper-{a}']").first):
+                    return True
+            await page.wait_for_timeout(500)
+        return False
+
+    resolved = await attempt_action_recovery(
+        page,
+        context="now_add_click",
+        goal=(
+            f"Add one unit of the product {match['title']!r} (ASIN {match['asin']}) "
+            "to the Amazon Now cart from this search-results page"
+        ),
+        failure_reason=(
+            "no recognisable Add button, quantity stepper, or size-variant control "
+            "was found on the product's result card"
+        ),
+        confirm=_confirm,
+        template_vars={"asin": match["asin"]},
+    )
+    if resolved:
+        record["added"] = True
+        record["resolved_by"] = resolved
+        print(f"[cart] Added to the Amazon Now cart (recovered via {resolved}).")
     else:
         record["reason"] = "add-to-cart click not confirmed"
     return record
@@ -504,14 +544,28 @@ async def add_one(page, name: str) -> dict:
         print(f"[cart] {record['reason']}")
         return record
 
+    card_selector = None
     try:
         await page.wait_for_selector(CART_SELECTORS["result_card"], timeout=8_000)
     except PlaywrightTimeoutError:
-        record["reason"] = "no search results"
-        print(f"[cart] No Fresh results for {name!r}.")
-        return record
+        # A genuinely empty search is not a failure — don't invoke the agent.
+        if await page.get_by_text("No results for", exact=False).count() > 0:
+            record["reason"] = "no search results"
+            print(f"[cart] No Fresh results for {name!r}.")
+            return record
+        # Self-heal: the card selector may have gone stale.
+        card_selector = await resolve_selector(
+            page, "cart.result_card",
+            "exactly one element per product search-result card, each card "
+            "containing a product title and a ₹ price",
+            expectation="₹", min_count=2,
+        )
+        if card_selector is None:
+            record["reason"] = "no search results"
+            print(f"[cart] No Fresh results for {name!r}.")
+            return record
 
-    candidates = await _scan_results(page)
+    candidates = await _scan_results(page, card_selector)
     if not candidates:
         record["reason"] = "no search results"
         print(f"[cart] No usable result cards for {name!r}.")
@@ -540,20 +594,40 @@ async def add_one(page, name: str) -> dict:
 
     cart_before = await _read_cart_count(page)
     clicked = await _click_add_for_asin(page, match["asin"])
-    if not clicked:
-        record["reason"] = "add-to-cart control not found"
-        print(f"[cart] Could not find an Add control for {match['asin']}.")
-        return record
-
-    await page.wait_for_timeout(2_000)
-    cart_after = await _read_cart_count(page)
-    if cart_after > cart_before:
-        record["added"] = True
-        print(f"[cart] Added (cart {cart_before} → {cart_after}).")
+    if clicked:
+        await page.wait_for_timeout(2_000)
+        cart_after = await _read_cart_count(page)
+        if cart_after > cart_before:
+            record["added"] = True
+            print(f"[cart] Added (cart {cart_before} → {cart_after}).")
+            return record
+        failure = f"clicked Add but cart count did not increase ({cart_before} → {cart_after})"
     else:
-        # The click landed but the badge didn't move — report it but don't claim success.
-        record["reason"] = f"clicked Add but cart count did not increase ({cart_before} → {cart_after})"
-        print(f"[cart] {record['reason']}")
+        failure = "add-to-cart control not found on the product's result card"
+    print(f"[cart] {failure}")
+
+    # Self-heal: let the agent try learned skills / DeepSeek before giving up.
+    async def _confirm() -> bool:
+        await page.wait_for_timeout(2_000)
+        return await _read_cart_count(page) > cart_before
+
+    resolved = await attempt_action_recovery(
+        page,
+        context="fresh_add_click",
+        goal=(
+            f"Add one unit of the product {match['title']!r} (ASIN {match['asin']}) "
+            "to the cart from this Amazon Fresh search-results page"
+        ),
+        failure_reason=failure,
+        confirm=_confirm,
+        template_vars={"asin": match["asin"]},
+    )
+    if resolved:
+        record["added"] = True
+        record["resolved_by"] = resolved
+        print(f"[cart] Added (recovered via {resolved}).")
+    else:
+        record["reason"] = failure
     return record
 
 
@@ -594,6 +668,7 @@ async def add_products_to_cart(product_names: list[str], headless: bool) -> dict
                         "product_url": rec["product_url"],
                         "asin": rec["asin"],
                         "source": rec["source"],
+                        **({"resolved_by": rec["resolved_by"]} if rec.get("resolved_by") else {}),
                     })
                 else:
                     not_found.append({

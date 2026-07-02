@@ -63,7 +63,10 @@ designed for local development and cloud deployment on **Render** (Docker-based)
 ├── requirements.txt
 ├── app.py                   # Flask web service (entry point) + Swagger UI at /docs
 ├── scrape_amazon_orders.py  # Core scraping logic; calls salesforce_sync at end
-├── amazon_cart.py           # Add Fresh products to cart by name (search + fuzzy match)
+├── amazon_cart.py           # Add products to cart by name (Now first, Fresh fallback)
+├── amazon_search.py         # GET /api/search backend (Amazon Now, Fresh fallback)
+├── agent_resolver.py        # Self-healing: DeepSeek recovery for failed DOM steps
+├── agent_skills.py          # Persistent store for learned recovery skills (skills.json)
 ├── otp_store.py             # In-process, short-TTL store for the 2-step OTP push
 └── salesforce_sync.py       # OAuth + PATCH Grocery_Product__c.title__c matches
 ```
@@ -98,6 +101,11 @@ designed for local development and cloud deployment on **Render** (Docker-based)
 | `OTP_TTL_SECONDS` | `300` — how long an OTP pushed to `POST /api/otp` stays valid before it is treated as stale. Short by design; the code is also cleared the instant it is consumed. |
 | `DELIVERY_ADDRESS_PREFIX` | _(empty)_ — after login the scraper first tries to pick the saved "Deliver to" address whose text contains this substring; only if no match is found does it fall back to `DELIVERY_PINCODE`. **Personal (PII)** — set it via env / `.env` / dashboard; no value is hard-coded in the repo. |
 | `DELIVERY_PINCODE` | _(empty)_ — 6-digit pincode entered as Amazon's "Deliver to" location when no saved address matches `DELIVERY_ADDRESS_PREFIX`. Fresh availability/price is per-location; with neither var set, location selection is skipped and items show "currently unavailable". **Personal (PII)** — set via env, not in the repo. |
+| `DEEPSEEK_API_KEY` | _(empty)_ — enables the self-healing agent (see "Agentic self-healing" below). Unset = agent off, everything behaves as before. **Secret** — env only. |
+| `DEEPSEEK_MODEL` | `deepseek-chat` |
+| `DEEPSEEK_BASE_URL` | `https://api.deepseek.com` |
+| `AGENT_ENABLED` | `true` — set `false` to disable the agent without removing the key. |
+| `SKILLS_PATH` | `skills.json` — where learned recovery skills persist. Durable locally; ephemeral on cloud hosts (commit a valuable skill file to keep it). |
 
 ## Environment Setup (Local)
 
@@ -131,6 +139,8 @@ PORT=3001 HEADLESS=false python app.py
 | `GET` | `/api/search?q=<query>` | Live product search on Amazon Now (`/tez/` storefront, via its `searchByKeyword` JSON captured in-page); falls back to the classic Fresh search only when Now returns nothing. Per-product `source` = `"Amazon Now"` or `"Amazon Fresh"` |
 | `GET` | `/api/cart` | Result of the last add-to-cart run: `{requested, added[], not_found[], cart_count, now_cart_count}` |
 | `POST` | `/api/cart` | Add products to the cart by name (background thread) — Amazon Now cart first, classic Fresh cart as per-product fallback. Body: `{"products": [<str>, ...]}` |
+| `GET` | `/api/skills` | Skills the self-healing agent has learned: `{agent_enabled, skills[]}` |
+| `DELETE` | `/api/skills/<id>` | Forget one learned skill (e.g. after Amazon changes its DOM again) |
 | `GET` | `/api/otp` | Is a run currently waiting for a 2-step OTP? `{waiting, waiting_since, ttl_seconds}` |
 | `POST` | `/api/otp` | Hand the 2-step verification OTP to a waiting run. Body: `{"otp": "<4-8 digits>"}` |
 
@@ -358,6 +368,49 @@ Cart-specific selectors live in `CART_SELECTORS` at the top of `amazon_cart.py`
 (same convention as `SELECTORS` in the scraper). The flow **stops at the cart**
 — it never opens checkout. A scrape and a cart run cannot run concurrently
 (shared Amazon account → `409`).
+
+## Agentic self-healing (DeepSeek)
+
+When a Playwright step fails in a way the code doesn't recognise — e.g. a
+product card whose Add button is really a "2 options" size-variant control, or
+a result-card selector that stopped matching — the app tries to recover at
+runtime instead of failing:
+
+1. **Learned skills first** (`agent_skills.py`, persisted in `skills.json`):
+   previously successful recipes for that situation are replayed — instant, no
+   LLM call. Two kinds: `action` (click/wait steps — applicable when its
+   `marker_selector` or its first click target exists on the page; run-specific
+   values like the ASIN are stored as `{asin}` placeholders so one recipe
+   generalises to every product) and `selector` (an alternative CSS selector
+   for a named slot like `search.result_card`).
+2. **DeepSeek on a novel failure** (`agent_resolver.py`): the goal, failure
+   reason and a compact snapshot of the page's interactive elements are sent to
+   DeepSeek (OpenAI-compatible API, `response_format=json_object`), which
+   returns a recipe. It is executed only after strict validation, and only a
+   recipe that then passes the caller's own confirmation check is persisted as
+   a new skill. One retry with error feedback, then the flow fails exactly as
+   it would have without the agent.
+
+Hook points: Now/Fresh add-to-cart clicks (`amazon_cart.py`, contexts
+`now_add_click`/`fresh_add_click`; successful recoveries are visible as
+`resolved_by` on the added item), Fresh search result cards
+(`amazon_search.py`/`amazon_cart.py`, slots `search.result_card`/
+`cart.result_card`), and order cards on the order-history page
+(`scrape_amazon_orders.py`, slot `scrape.order_card`).
+
+Guardrails (enforced in code, not by the prompt):
+
+- Skills are **data, never code** — the LLM cannot inject Python.
+- Allowed actions: `click` and `wait` only, max 5 steps, no navigation.
+- Selectors matching `checkout|buy|pay|place order|address|sign out|delete`
+  are rejected outright; the flow still never proceeds past the cart.
+- Captcha and `/ap/` auth pages are classified non-resolvable — no tokens
+  spent; "no results" pages are recognised as legitimate empties, not failures.
+- The happy path never calls the LLM (failure-only), and with no
+  `DEEPSEEK_API_KEY` the agent is fully disabled (pre-agent behavior).
+
+`GET /api/skills` lists what has been learned; `DELETE /api/skills/<id>`
+forgets a skill that has gone stale.
 
 ## Out of Scope
 

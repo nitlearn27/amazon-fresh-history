@@ -1,0 +1,39 @@
+[
+ {
+  "kind": "action",
+  "context": "now_add_click",
+  "steps": [
+   {
+    "action": "click",
+    "selector": "div[data-csa-c-content-id*='{asin}'] button.sc-98582c3a-0.sc-1f20f77e-0.sc-e5fd909b-0"
+   },
+   {
+    "action": "wait",
+    "ms": 2000
+   },
+   {
+    "action": "click",
+    "selector": "button[data-csa-c-content-id*='AsinVariationsBottomBanner-AddToCart-{asin}']"
+   },
+   {
+    "action": "wait",
+    "ms": 1000
+   },
+   {
+    "action": "click",
+    "selector": "button:has-text('Confirm')"
+   },
+   {
+    "action": "wait",
+    "ms": 2000
+   }
+  ],
+  "marker_selector": "div[data-csa-c-content-id*='CpiWidget']",
+  "description": "Selects the correct variant from a bottom sheet and confirms the addition to cart.",
+  "source": "deepseek",
+  "id": "5828ad67644b",
+  "created_at": "2026-07-02T07:40:11.380291+00:00",
+  "hits": 1,
+  "last_used_at": "2026-07-02T07:42:32.159436+00:00"
+ }
+]
