@@ -1,11 +1,13 @@
 """
-Add Amazon Fresh (amazon.in) products to the cart by name.
+Add amazon.in products to the cart by name — Amazon Now first, Fresh fallback.
 
-Given a list of real product names, this module searches the Amazon Fresh
-storefront for each, fuzzy-matches the best result above a confidence
-threshold, and adds one unit of it to the cart. Unmatched names are skipped
-and reported. The flow NEVER proceeds to checkout/payment — matched items are
-left in the cart for manual review.
+Given a list of real product names, this module searches the Amazon Now
+(/tez/ quick-commerce) storefront for each, fuzzy-matches the best in-stock
+result above a confidence threshold, and adds one unit to the Now cart (which
+is separate from the main Amazon cart). Only when Now has no confident match
+does it fall back to the classic Amazon Fresh search and cart. Unmatched names
+are skipped and reported. The flow NEVER proceeds to checkout/payment —
+matched items are left in the cart for manual review.
 
 Login, OTP/captcha handling, and delivery-location setup are reused wholesale
 from scrape_amazon_orders.open_logged_in_page (Fresh availability and the
@@ -23,7 +25,7 @@ from urllib.parse import quote
 
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
 
-from scrape_amazon_orders import AMAZON_HOME, open_logged_in_page
+from scrape_amazon_orders import AMAZON_HOME, AMAZON_NOW_BRAND_ID, open_logged_in_page
 
 # ---------------------------------------------------------------------------
 # Selectors — update here when Amazon changes its markup. Mirrors the SELECTORS
@@ -41,6 +43,16 @@ CART_SELECTORS = {
     ),
     # Global cart-count badge in the nav bar.
     "cart_count": "#nav-cart-count, #nav-cart-count-container #nav-cart-count",
+    # Amazon Now (/tez/ SPA) search results: per-ASIN Add button ({asin} is
+    # substituted), plus a generic variant for fallback scans.
+    "now_add_button": "button[data-csa-c-content-id='AsinFaceout-AddToCart-{asin}']",
+    "now_add_button_any": "button[data-csa-c-slot-id='AsinFaceout-AddToCart']",
+    # When the item is already in the Now cart, the Add button is replaced by a
+    # quantity stepper; its "+" button adds one more unit.
+    "now_qty_increase": (
+        "button[data-csa-c-content-id='AsinFaceout-AddToCartQtyStepper-{asin}']"
+        "[aria-label*='Increase' i]"
+    ),
 }
 
 # Amazon Fresh / "Now" store node. Restricting the search to this node keeps
@@ -77,6 +89,51 @@ def _best_match(query: str, candidate_titles: list[str]) -> tuple[int, float]:
         if score > best_score:
             best_idx, best_score = i, score
     return best_idx, best_score
+
+
+async def _read_now_cart_count(page) -> int | None:
+    """Item count in the Amazon Now cart (separate from the main cart),
+    read from the getcart XHR the /tez/ SPA fires on load. None if unknown.
+
+    The body is parsed eagerly inside a response listener — the SPA's follow-up
+    navigations dispose response bodies, so waiting via expect_response and
+    reading afterwards races and loses."""
+    payloads: list[dict] = []
+
+    async def _capture(resp):
+        if "tez/order/getcart" in resp.url and resp.status == 200:
+            try:
+                payloads.append(await resp.json())
+            except Exception:
+                pass
+
+    page.on("response", _capture)
+    try:
+        # Any /tez/browse/ page fires getcart on load; the bare /tez home and
+        # cart routes do not.
+        await page.goto(_now_search_url("milk"), wait_until="domcontentloaded")
+        for _ in range(20):
+            if payloads:
+                break
+            await page.wait_for_timeout(500)
+    except Exception as exc:
+        print(f"[cart] Could not read the Amazon Now cart count ({exc}).")
+        return None
+    finally:
+        page.remove_listener("response", _capture)
+
+    if not payloads:
+        print("[cart] Amazon Now getcart XHR not seen; cart count unknown.")
+        return None
+    payload = payloads[0]
+
+    items = (((payload or {}).get("data") or {}).get("cartResponse") or {}).get("cartItems")
+    if not isinstance(items, list):
+        return None
+    try:
+        return sum(int(i.get("quantity") or 1) for i in items)
+    except Exception:
+        return len(items)
 
 
 async def _read_cart_count(page) -> int:
@@ -194,6 +251,144 @@ async def _click_add_for_asin(page, asin: str) -> bool:
     return False
 
 
+def _now_search_url(name: str) -> str:
+    return (
+        f"{AMAZON_HOME}/tez/browse/search"
+        f"?qcbrand={AMAZON_NOW_BRAND_ID}&searchKeyword={quote(name)}"
+    )
+
+
+async def _scan_now_results(page, name: str) -> list[dict]:
+    """Search Amazon Now (/tez/) for `name` and return in-stock candidates as
+    {asin, title, price} dicts.
+
+    The SPA's grid is obfuscated styled-components, but it hydrates from one
+    JSON XHR (tez/browse/searchByKeyword) we capture in-page — calling that
+    endpoint directly returns 204 (needs the SPA's CSRF headers)."""
+    try:
+        async with page.expect_response(
+            lambda r: "tez/browse/searchByKeyword" in r.url, timeout=20_000
+        ) as resp_info:
+            await page.goto(_now_search_url(name), wait_until="domcontentloaded")
+        resp = await resp_info.value
+        payload = await resp.json()
+    except PlaywrightTimeoutError:
+        print(f"[cart] Amazon Now search XHR did not fire for {name!r}.")
+        return []
+    except Exception as exc:
+        print(f"[cart] Amazon Now search failed for {name!r}: {exc}")
+        return []
+
+    raw = (((payload or {}).get("data") or {}).get("searchResponse") or {}).get("products") or []
+    candidates = []
+    for p in raw:
+        asin = (p.get("asin") or "").strip()
+        title = (p.get("title") or "").strip()
+        if not asin or len(title) < 3:
+            continue
+        if (p.get("availability") or {}).get("type") != "IN_STOCK":
+            continue
+        candidates.append({
+            "asin": asin,
+            "title": title,
+            "price": (p.get("buyingPrice") or {}).get("amount"),
+        })
+        if len(candidates) >= MAX_RESULTS_TO_SCAN:
+            break
+    return candidates
+
+
+async def _click_now_add_for_asin(page, asin: str) -> bool:
+    """Click the Amazon Now Add button for `asin` — or, when the item is
+    already in the Now cart, the quantity stepper's "+" (both add one unit).
+    Returns True if the click landed and the SPA acknowledged it (cart XHR or
+    the button turning into a quantity stepper)."""
+    btn = page.locator(CART_SELECTORS["now_add_button"].format(asin=asin)).first
+    try:
+        await btn.wait_for(state="visible", timeout=10_000)
+    except Exception:
+        btn = page.locator(CART_SELECTORS["now_qty_increase"].format(asin=asin)).first
+        try:
+            await btn.wait_for(state="visible", timeout=3_000)
+            print(f"[cart] {asin} is already in the Now cart — adding one more unit.")
+        except Exception:
+            print(f"[cart] No Amazon Now Add button or quantity stepper rendered for {asin}.")
+            return False
+    try:
+        await btn.scroll_into_view_if_needed(timeout=3_000)
+    except Exception:
+        pass
+
+    # The SPA confirms an add with a /tez/ cart XHR; the Add button is also
+    # replaced by a quantity stepper. Accept either signal.
+    try:
+        async with page.expect_response(
+            lambda r: "/tez/" in r.url and "cart" in r.url.lower() and r.status < 400,
+            timeout=10_000,
+        ):
+            await btn.click(timeout=5_000)
+        return True
+    except PlaywrightTimeoutError:
+        await page.wait_for_timeout(1_000)
+        stepper_gone = await btn.count() == 0 or not await btn.is_visible()
+        if stepper_gone:
+            print(f"[cart] No cart XHR seen for {asin}, but the Add button changed — treating as added.")
+        return stepper_gone
+    except Exception as exc:
+        print(f"[cart] Amazon Now Add click failed for {asin}: {exc}")
+        return False
+
+
+async def add_one_now(page, name: str) -> dict:
+    """Search Amazon Now for `name`, fuzzy-match the best in-stock result, and
+    add one unit to the Now cart. Same record shape as add_one()."""
+    print(f"\n[cart] Searching Amazon Now for {name!r}…")
+    record = {
+        "requested_name": name,
+        "matched_title": None,
+        "asin": None,
+        "score": 0.0,
+        "price": None,
+        "product_url": None,
+        "added": False,
+        "reason": None,
+        "source": "Amazon Now",
+    }
+
+    candidates = await _scan_now_results(page, name)
+    if not candidates:
+        record["reason"] = "no search results"
+        print(f"[cart] No Amazon Now results for {name!r}.")
+        return record
+
+    print(f"[cart] Scanned {len(candidates)} Now result(s):")
+    for c in candidates:
+        print(f"         • [{c['asin']}] {c['title'][:90]}")
+
+    idx, score = _best_match(name, [c["title"] for c in candidates])
+    record["score"] = round(score, 3)
+    if idx < 0 or score < MATCH_THRESHOLD:
+        best = candidates[idx]["title"] if idx >= 0 else None
+        record["reason"] = f"best score {score:.2f} below threshold {MATCH_THRESHOLD}"
+        record["best_candidate"] = best
+        print(f"[cart] No confident Now match for {name!r} (best={best!r} @ {score:.2f}).")
+        return record
+
+    match = candidates[idx]
+    record["matched_title"] = match["title"]
+    record["asin"] = match["asin"]
+    record["price"] = match["price"]
+    record["product_url"] = f"{AMAZON_HOME}/dp/{match['asin']}"
+    print(f"[cart] Now match for {name!r}: {match['title'][:70]!r} @ {score:.2f}")
+
+    if await _click_now_add_for_asin(page, match["asin"]):
+        record["added"] = True
+        print(f"[cart] Added to the Amazon Now cart.")
+    else:
+        record["reason"] = "add-to-cart click not confirmed"
+    return record
+
+
 async def add_one(page, name: str) -> dict:
     """Search Fresh for `name`, fuzzy-match the best result, and add one unit
     to the cart. Returns a per-item result record."""
@@ -207,6 +402,7 @@ async def add_one(page, name: str) -> dict:
         "product_url": None,
         "added": False,
         "reason": None,
+        "source": "Amazon Fresh",
     }
 
     try:
@@ -274,8 +470,10 @@ async def add_one(page, name: str) -> dict:
 
 
 async def add_products_to_cart(product_names: list[str], headless: bool) -> dict:
-    """Log in, set the Fresh delivery location, and add one unit of each
-    matched product to the cart. Returns a partitioned result dict."""
+    """Log in, set the delivery location, and add one unit of each matched
+    product to the cart — Amazon Now first, falling back to the classic Fresh
+    flow per product when Now has no confident match. Returns a partitioned
+    result dict; the Now cart is separate from the main Amazon cart."""
     # De-duplicate while preserving order, dropping blanks.
     names: list[str] = []
     seen: set[str] = set()
@@ -289,12 +487,16 @@ async def add_products_to_cart(product_names: list[str], headless: bool) -> dict
     added: list[dict] = []
     not_found: list[dict] = []
     cart_count = 0
+    now_cart_count: int | None = None
 
     async with async_playwright() as pw:
         browser, context, page = await open_logged_in_page(pw, headless)
         try:
             for name in names:
-                rec = await add_one(page, name)
+                rec = await add_one_now(page, name)
+                if not rec["added"]:
+                    print(f"[cart] Amazon Now could not add {name!r} ({rec['reason']}); falling back to Fresh.")
+                    rec = await add_one(page, name)
                 if rec["added"]:
                     added.append({
                         "requested_name": rec["requested_name"],
@@ -303,6 +505,7 @@ async def add_products_to_cart(product_names: list[str], headless: bool) -> dict
                         "price": rec["price"],
                         "product_url": rec["product_url"],
                         "asin": rec["asin"],
+                        "source": rec["source"],
                     })
                 else:
                     not_found.append({
@@ -311,6 +514,11 @@ async def add_products_to_cart(product_names: list[str], headless: bool) -> dict
                         "score": rec["score"],
                         "reason": rec["reason"],
                     })
+            if any(a["source"] == "Amazon Now" for a in added):
+                now_cart_count = await _read_now_cart_count(page)
+            # The Fresh nav badge only exists on classic pages — leave any /tez/
+            # page before reading it.
+            await page.goto(AMAZON_HOME, wait_until="domcontentloaded")
             cart_count = await _read_cart_count(page)
         finally:
             await context.close()
@@ -321,12 +529,14 @@ async def add_products_to_cart(product_names: list[str], headless: bool) -> dict
         "added": added,
         "not_found": not_found,
         "cart_count": cart_count,
+        "now_cart_count": now_cart_count,
         "added_at": datetime.now(tz=timezone.utc).astimezone().isoformat(),
     }
 
     print(
         f"\n[cart] Done: {len(added)} added, {len(not_found)} not matched, "
-        f"cart now holds {cart_count} item(s)."
+        f"cart holds {cart_count} item(s), Now cart "
+        f"{now_cart_count if now_cart_count is not None else 'n/a'}."
     )
     return result
 

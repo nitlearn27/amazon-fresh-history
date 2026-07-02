@@ -129,8 +129,8 @@ PORT=3001 HEADLESS=false python app.py
 | `GET` | `/api/products` | Latest scrape output, `{product_name, date, number_of_times_purchased, ...}` shape |
 | `POST` | `/api/products` | Start a scrape (runs in background thread). Body: `{"orders": <int>}`, default 10 |
 | `GET` | `/api/search?q=<query>` | Live product search on Amazon Now (`/tez/` storefront, via its `searchByKeyword` JSON captured in-page); falls back to the classic Fresh search only when Now returns nothing. Per-product `source` = `"Amazon Now"` or `"Amazon Fresh"` |
-| `GET` | `/api/cart` | Result of the last add-to-cart run: `{requested, added[], not_found[], cart_count}` |
-| `POST` | `/api/cart` | Add Amazon Fresh products to the cart by name (background thread). Body: `{"products": [<str>, ...]}` |
+| `GET` | `/api/cart` | Result of the last add-to-cart run: `{requested, added[], not_found[], cart_count, now_cart_count}` |
+| `POST` | `/api/cart` | Add products to the cart by name (background thread) — Amazon Now cart first, classic Fresh cart as per-product fallback. Body: `{"products": [<str>, ...]}` |
 | `GET` | `/api/otp` | Is a run currently waiting for a 2-step OTP? `{waiting, waiting_since, ttl_seconds}` |
 | `POST` | `/api/otp` | Hand the 2-step verification OTP to a waiting run. Body: `{"otp": "<4-8 digits>"}` |
 
@@ -333,15 +333,24 @@ thread:
 
 1. **Reuse the session** — `open_logged_in_page()` (factored out of
    `scrape_amazon_orders.run()`) does launch + login + OTP/captcha handling +
-   delivery-location setup, identical to a scrape. The Fresh add-to-cart button
+   delivery-location setup, identical to a scrape. Add-to-cart availability
    is location-keyed, so this setup is required.
-2. **For each name** — search the Fresh node
-   (`/s?k=<name>&i=nowstore`), scan up to `MAX_RESULTS_TO_SCAN` result cards,
-   and pick the best title by `difflib.SequenceMatcher` ratio. Add one unit only
-   if the score clears `MATCH_THRESHOLD` (default `0.6`); confirm via the
-   `#nav-cart-count` badge incrementing.
-3. **Report** — return `{requested, added[], not_found[], cart_count, added_at}`.
-   Unmatched names land in `not_found` with their best candidate + score.
+2. **For each name — Amazon Now first**: load the `/tez/` search page
+   (`/tez/browse/search?qcbrand=<brand>&searchKeyword=<name>`) and capture the
+   `searchByKeyword` JSON it fetches (the endpoint 204s when called directly —
+   CSRF), fuzzy-match the best `IN_STOCK` title (`difflib.SequenceMatcher`,
+   same `MATCH_THRESHOLD` `0.6`), then click that ASIN's Add button
+   (`AsinFaceout-AddToCart-<ASIN>`); the add is confirmed by the SPA's cart
+   XHR. Items go to the **Amazon Now cart, which is separate from the main
+   Amazon cart**.
+3. **Fresh fallback (per product)** — only when Now has no confident match or
+   the add fails: search the classic node (`/s?k=<name>&i=nowstore`), scan up
+   to `MAX_RESULTS_TO_SCAN` result cards, same fuzzy match, add one unit and
+   confirm via the `#nav-cart-count` badge incrementing.
+4. **Report** — return `{requested, added[], not_found[], cart_count,
+   now_cart_count, added_at}`; each added item carries `source` ("Amazon Now"
+   or "Amazon Fresh"). Unmatched names land in `not_found` with their best
+   candidate + score.
 
 Cart-specific selectors live in `CART_SELECTORS` at the top of `amazon_cart.py`
 (same convention as `SELECTORS` in the scraper). The flow **stops at the cart**

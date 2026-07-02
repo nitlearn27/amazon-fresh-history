@@ -434,7 +434,7 @@ _OPENAPI_SPEC = {
         {"name": "system",   "description": "Health and liveness."},
         {"name": "scrape",   "description": "Trigger Amazon Fresh scrapes."},
         {"name": "products", "description": "Read the latest scrape output."},
-        {"name": "cart",     "description": "Add Amazon Fresh products to the cart by name."},
+        {"name": "cart",     "description": "Add products to the cart by name — Amazon Now first, Fresh fallback."},
         {"name": "search",   "description": "Search Amazon Fresh/Now catalog."},
         {"name": "auth",     "description": "Hand the 2-step verification OTP to a waiting run."},
     ],
@@ -604,12 +604,15 @@ _OPENAPI_SPEC = {
             },
             "post": {
                 "tags": ["cart"],
-                "summary": "Add Amazon Fresh products to the cart by name",
+                "summary": "Add products to the cart by name (Amazon Now first)",
                 "description": (
-                    "Searches Amazon Fresh for each name, fuzzy-matches the best result, and "
-                    "adds one unit of it to the cart. Unmatched names are skipped and reported. "
-                    "Never proceeds to checkout. Returns `202 started` immediately; poll "
-                    "`GET /api/cart` for the result."
+                    "For each name, searches Amazon Now (the /tez/ quick-commerce storefront) "
+                    "first, fuzzy-matches the best in-stock result, and adds one unit to the "
+                    "Now cart; only when Now has no confident match does it fall back to the "
+                    "classic Amazon Fresh search/cart. Each added item's `source` says which "
+                    "cart it went to (the Now cart is separate from the main Amazon cart). "
+                    "Unmatched names are skipped and reported. Never proceeds to checkout. "
+                    "Returns `202 started` immediately; poll `GET /api/cart` for the result."
                 ),
                 "requestBody": {
                     "required": True,
@@ -840,6 +843,8 @@ _OPENAPI_SPEC = {
                     "price":          {"type": "number", "nullable": True, "example": 35.0},
                     "product_url":    {"type": "string", "nullable": True, "example": "https://www.amazon.in/dp/B0..."},
                     "asin":           {"type": "string", "nullable": True, "example": "B0..."},
+                    "source":         {"type": "string", "enum": ["Amazon Now", "Amazon Fresh"],
+                                       "description": "Which cart the item was added to."},
                 },
             },
             "NotFoundItem": {
@@ -860,7 +865,9 @@ _OPENAPI_SPEC = {
                     "added":      {"type": "array", "items": {"$ref": "#/components/schemas/CartItem"}},
                     "not_found":  {"type": "array", "items": {"$ref": "#/components/schemas/NotFoundItem"}},
                     "cart_count": {"type": "integer", "example": 5,
-                                   "description": "Total items in the cart after the run (nav badge)."},
+                                   "description": "Total items in the main/Fresh cart after the run (nav badge)."},
+                    "now_cart_count": {"type": "integer", "nullable": True, "example": 2,
+                                       "description": "Items in the separate Amazon Now cart; null when not readable."},
                     "added_at":   {"type": "string", "format": "date-time"},
                 },
             },
@@ -883,7 +890,7 @@ _OPENAPI_SPEC = {
                     "product_url": {"type": "string", "nullable": True, "example": "https://..."},
                     "rating": {"type": "number", "nullable": True, "example": 4.3},
                     "scraped_at": {"type": "string", "format": "date-time", "example": "2026-06-28T18:02:18.457Z"},
-                    "source": {"type": "string", "example": "Amazon now"},
+                    "source": {"type": "string", "enum": ["Amazon Now", "Amazon Fresh"], "example": "Amazon Now"},
                     "weight": {"type": "string", "nullable": True, "example": "500 gm"}
                 }
             },
