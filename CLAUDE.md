@@ -338,8 +338,10 @@ thread:
 2. **For each name — Amazon Now first**: load the `/tez/` search page
    (`/tez/browse/search?qcbrand=<brand>&searchKeyword=<name>`) and capture the
    `searchByKeyword` JSON it fetches (the endpoint 204s when called directly —
-   CSRF), fuzzy-match the best `IN_STOCK` title (`difflib.SequenceMatcher`,
-   same `MATCH_THRESHOLD` `0.6`), then click that ASIN's Add button
+   CSRF), fuzzy-match the best `IN_STOCK` title (max of `difflib` char ratio
+   and word coverage — a title containing every query word scores 0.6+, so
+   short names like "Bhindi" match; `MATCH_THRESHOLD` `0.6`), then click that
+   ASIN's Add button
    (`AsinFaceout-AddToCart-<ASIN>`); the add is confirmed by the SPA's cart
    XHR. Items go to the **Amazon Now cart, which is separate from the main
    Amazon cart**.

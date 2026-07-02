@@ -81,11 +81,24 @@ def _normalize(text: str) -> str:
 
 def _best_match(query: str, candidate_titles: list[str]) -> tuple[int, float]:
     """Return (index, score) of the candidate title most similar to `query`.
-    Score is a difflib ratio in [0, 1]. Returns (-1, 0.0) for an empty list."""
+    Score is in [0, 1]. Returns (-1, 0.0) for an empty list.
+
+    The score is the max of two signals:
+    - difflib character ratio — good for fullish product names;
+    - word coverage — when EVERY word of the query appears in the title, the
+      title scores 0.6+ (so short generic queries like "bhindi" still clear
+      MATCH_THRESHOLD), with tighter titles (fewer extra words) ranking
+      higher. A query word missing from the title gets no boost, so
+      "bhindi masala powder" does not match plain bhindi."""
+    q_tokens = set(_normalize(query).split())
     nq = _normalize(query)
     best_idx, best_score = -1, 0.0
     for i, title in enumerate(candidate_titles):
-        score = difflib.SequenceMatcher(None, nq, _normalize(title)).ratio()
+        nt = _normalize(title)
+        score = difflib.SequenceMatcher(None, nq, nt).ratio()
+        t_tokens = set(nt.split())
+        if q_tokens and t_tokens and q_tokens <= t_tokens:
+            score = max(score, 0.6 + 0.4 * (len(q_tokens) / len(t_tokens)))
         if score > best_score:
             best_idx, best_score = i, score
     return best_idx, best_score
