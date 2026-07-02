@@ -128,6 +128,7 @@ PORT=3001 HEADLESS=false python app.py
 | `GET` | `/openapi.json` | OpenAPI 3.0 spec |
 | `GET` | `/api/products` | Latest scrape output, `{product_name, date, number_of_times_purchased, ...}` shape |
 | `POST` | `/api/products` | Start a scrape (runs in background thread). Body: `{"orders": <int>}`, default 10 |
+| `GET` | `/api/search?q=<query>` | Live product search on Amazon Now (`/tez/` storefront, via its `searchByKeyword` JSON captured in-page); falls back to the classic Fresh search only when Now returns nothing. Per-product `source` = `"Amazon Now"` or `"Amazon Fresh"` |
 | `GET` | `/api/cart` | Result of the last add-to-cart run: `{requested, added[], not_found[], cart_count}` |
 | `POST` | `/api/cart` | Add Amazon Fresh products to the cart by name (background thread). Body: `{"products": [<str>, ...]}` |
 | `GET` | `/api/otp` | Is a run currently waiting for a 2-step OTP? `{waiting, waiting_since, ttl_seconds}` |

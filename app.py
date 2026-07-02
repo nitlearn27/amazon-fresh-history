@@ -523,8 +523,13 @@ _OPENAPI_SPEC = {
         "/api/search": {
             "get": {
                 "tags": ["search"],
-                "summary": "Search Amazon Fresh/Now catalog",
-                "description": "Performs a live search for a product on Amazon Fresh/Now and returns details.",
+                "summary": "Search Amazon Now catalog (Fresh fallback)",
+                "description": (
+                    "Performs a live search on Amazon Now (the /tez/ quick-commerce "
+                    "storefront) and returns details; falls back to the classic Amazon "
+                    "Fresh search only when Now returns no products. Each product's "
+                    "`source` says where it came from: `\"Amazon Now\"` or `\"Amazon Fresh\"`."
+                ),
                 "parameters": [
                     {
                         "name": "q",

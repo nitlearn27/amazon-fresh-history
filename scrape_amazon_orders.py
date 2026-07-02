@@ -59,6 +59,9 @@ SELECTORS = {
     "pincode_done": "button[name='glowDoneButton'], #GLUXConfirmClose, .a-popover-footer .a-button-input",
     "location_header": "#glow-ingress-line2",
     "address_list": "#GLUXAddressList, #glow-toaster-content",
+    # Each saved address is a submit input whose aria-label carries the full
+    # address text — the most reliable thing to match and click.
+    "address_option": "#GLUXAddressList input.a-button-input",
     # Orders page
     "order_card": "div.order-card, div.js-order-card, [class*='order-card']",
     "order_filter_dropdown": "select#orderFilter, select[name='orderFilter']",
@@ -569,6 +572,14 @@ async def login(page, amazon_username: str, amazon_password: str, headless: bool
         print("[auth] Signin: networkidle did not fire within 10s (continuing).")
     await _log_page_state(page, "on signin page")
 
+    # A still-valid session bounces the signin URL straight back to the
+    # return_to page without ever showing the email form (seen when the orders
+    # page demands re-auth via max_auth_age=0 but the session cookie itself is
+    # fine). Detect it instead of failing on a missing email input.
+    if "/ap/" not in page.url.lower() and await is_logged_in(page):
+        print("[auth] Signin redirected to a logged-in page — session is already valid; skipping login.")
+        return
+
     await _handle_captcha_block(page)
 
     # Step 1: email/phone
@@ -702,11 +713,16 @@ async def _open_location_popover(page) -> bool:
         trigger = page.locator(SELECTORS["location_trigger"]).first
         await trigger.wait_for(state="visible", timeout=8_000)
         await trigger.click()
-        await page.wait_for_timeout(1_000)
     except Exception as exc:
         print(f"[location] Could not open location popover ({exc}).")
         return False
-    return await _location_widget_open(page)
+    # The popover content (address list / pincode input) is AJAX-loaded and can
+    # take a few seconds — poll instead of a single fixed wait.
+    for _ in range(16):
+        await page.wait_for_timeout(500)
+        if await _location_widget_open(page):
+            return True
+    return False
 
 
 async def _select_saved_address(page, address_prefix: str) -> bool:
@@ -714,20 +730,44 @@ async def _select_saved_address(page, address_prefix: str) -> bool:
     text contains `address_prefix`. Returns True only if a matching address
     was found and clicked."""
     print(f"[location] Looking for saved address containing {address_prefix!r}…")
-    candidates = (
-        page.locator(SELECTORS["address_list"]).get_by_text(address_prefix, exact=False),
-        page.get_by_text(address_prefix, exact=False),
-    )
+    # The saved-address list is AJAX-loaded into the popover — wait for it.
+    try:
+        await page.locator(SELECTORS["address_option"]).first.wait_for(
+            state="attached", timeout=8_000
+        )
+    except Exception:
+        print("[location] Saved-address list did not load in the popover.")
+
+    # Primary match: the address option whose aria-label contains the prefix.
+    needle = re.sub(r"\s+", " ", address_prefix).strip().lower()
     target = None
-    for loc in candidates:
-        try:
-            if await loc.count() > 0:
-                target = loc.first
-                break
-        except Exception:
-            continue
+    options = page.locator(SELECTORS["address_option"])
+    labels: list[str] = []
+    for i in range(await options.count()):
+        option = options.nth(i)
+        label = re.sub(r"\s+", " ", (await option.get_attribute("aria-label")) or "")
+        labels.append(label)
+        if needle and needle in label.lower():
+            target = option
+            break
+
+    if target is None:
+        # Fallback: the older text-based matching.
+        candidates = (
+            page.locator(SELECTORS["address_list"]).get_by_text(address_prefix, exact=False),
+            page.get_by_text(address_prefix, exact=False),
+        )
+        for loc in candidates:
+            try:
+                if await loc.count() > 0:
+                    target = loc.first
+                    break
+            except Exception:
+                continue
     if target is None:
         print(f"[location] No saved address matching {address_prefix!r}.")
+        if labels:
+            print(f"[location] Saved addresses seen: {labels}")
         return False
 
     try:
